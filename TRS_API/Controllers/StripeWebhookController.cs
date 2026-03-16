@@ -289,7 +289,7 @@ namespace TRS_API.Controllers
 
                 if (payment != null && payment.PaymentStatus == "P")
                 {
-                    payment.PaymentStatus = "E";
+                    payment.PaymentStatus = "X"; // Cancelled/expired
 
                     _db.WebhookLogs.Add(new WebhookLog
                     {
