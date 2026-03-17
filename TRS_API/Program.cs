@@ -13,9 +13,13 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(c => {
-    c.AddSecurityDefinition("Bearer", new Microsoft.OpenApi.Models.OpenApiSecurityScheme {
-        Name = "Authorization", Type = Microsoft.OpenApi.Models.SecuritySchemeType.Http,
-        Scheme = "bearer", BearerFormat = "JWT", In = Microsoft.OpenApi.Models.ParameterLocation.Header,
+    c.AddSecurityDefinition("Bearer", new Microsoft.OpenApi.Models.OpenApiSecurityScheme
+    {
+        Name = "Authorization",
+        Type = Microsoft.OpenApi.Models.SecuritySchemeType.Http,
+        Scheme = "bearer",
+        BearerFormat = "JWT",
+        In = Microsoft.OpenApi.Models.ParameterLocation.Header,
     });
     c.AddSecurityRequirement(new Microsoft.OpenApi.Models.OpenApiSecurityRequirement {
         { new Microsoft.OpenApi.Models.OpenApiSecurityScheme {
@@ -35,14 +39,15 @@ var jwtSecret = builder.Configuration["Jwt:Secret"]
 
 builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
     .AddJwtBearer(options => {
-        options.TokenValidationParameters = new TokenValidationParameters {
-            ValidateIssuer           = true,
-            ValidateAudience         = true,
-            ValidateLifetime         = true,
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuer = true,
+            ValidateAudience = true,
+            ValidateLifetime = true,
             ValidateIssuerSigningKey = true,
-            ValidIssuer              = builder.Configuration["Jwt:Issuer"],
-            ValidAudience            = builder.Configuration["Jwt:Audience"],
-            IssuerSigningKey         = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtSecret)),
+            ValidIssuer = builder.Configuration["Jwt:Issuer"],
+            ValidAudience = builder.Configuration["Jwt:Audience"],
+            IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtSecret)),
         };
     });
 builder.Services.AddAuthorization();
@@ -66,14 +71,15 @@ builder.Services.AddCors(options => {
 // Rate Limiting
 builder.Services.AddRateLimiter(options =>
     options.AddFixedWindowLimiter("payment", opt => {
-        opt.Window      = TimeSpan.FromMinutes(builder.Configuration.GetValue<int>("RateLimiting:WindowMinutes", 1));
+        opt.Window = TimeSpan.FromMinutes(builder.Configuration.GetValue<int>("RateLimiting:WindowMinutes", 1));
         opt.PermitLimit = builder.Configuration.GetValue<int>("RateLimiting:PermitLimit", 5);
     }));
 
 var app = builder.Build();
 
 // ── Middleware ────────────────────────────────────────────────────────────────
-if (app.Environment.IsDevelopment()) {
+if (app.Environment.IsDevelopment())
+{
     app.UseSwagger();
     app.UseSwaggerUI();
 }
@@ -90,8 +96,8 @@ app.Use(async (ctx, next) => {
         (isDev ? "connect-src 'self' https://localhost:7183 https://*.stripe.com;"
                : "connect-src 'self' https://*.stripe.com;");
     ctx.Response.Headers["X-Content-Type-Options"] = "nosniff";
-    ctx.Response.Headers["X-Frame-Options"]        = "SAMEORIGIN";
-    ctx.Response.Headers["X-XSS-Protection"]       = "1; mode=block";
+    ctx.Response.Headers["X-Frame-Options"] = "SAMEORIGIN";
+    ctx.Response.Headers["X-XSS-Protection"] = "1; mode=block";
     await next();
 });
 
@@ -99,5 +105,6 @@ app.UseCors("AllowFrontend");
 app.UseRateLimiter();
 app.UseAuthentication();
 app.UseAuthorization();
+app.UseStaticFiles();  // serves TRS_API/wwwroot/** at root URL
 app.MapControllers();
 app.Run();

@@ -1,3 +1,4 @@
+using TRS_API.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
@@ -11,8 +12,9 @@ public class RegistrationsController : ControllerBase
 {
     private readonly TRSDbContext _db;
     private readonly ILogger<RegistrationsController> _log;
-    public RegistrationsController(TRSDbContext db, ILogger<RegistrationsController> log)
-        => (_db, _log) = (db, log);
+    private readonly ReceiptService _receipt;
+    public RegistrationsController(TRSDbContext db, ILogger<RegistrationsController> log, ReceiptService receipt)
+        => (_db, _log, _receipt) = (db, log, receipt);
 
     // ── GET /api/registrations  ── admin, paged + filtered ─────────────────
     [HttpGet, Authorize]
@@ -27,7 +29,7 @@ public class RegistrationsController : ControllerBase
             .Include(r => r.Payments).ThenInclude(p => p.Items)
             .AsQueryable();
 
-        if (eventId.HasValue)  q = q.Where(r => r.EventId == eventId);
+        if (eventId.HasValue) q = q.Where(r => r.EventId == eventId);
         if (programId.HasValue) q = q.Where(r => r.ParticipantGroups.Any(g => g.ProgramId == programId));
         if (!string.IsNullOrEmpty(regStatus)) q = q.Where(r => r.RegStatus == regStatus);
         if (!string.IsNullOrEmpty(payStatus))
@@ -40,9 +42,12 @@ public class RegistrationsController : ControllerBase
         var items = await q.OrderByDescending(r => r.SubmittedAt)
             .Skip((page - 1) * pageSize).Take(pageSize).ToListAsync();
 
-        return Ok(new {
-            items      = items.Select(MapReg),
-            total, page, pageSize,
+        return Ok(new
+        {
+            items = items.Select(MapReg),
+            total,
+            page,
+            pageSize,
             totalPages = (int)Math.Ceiling((double)total / pageSize)
         });
     }
@@ -63,14 +68,19 @@ public class RegistrationsController : ControllerBase
         using var tx = await _db.Database.BeginTransactionAsync();
         try
         {
-            var reg = new EventRegistration {
-                EventId = req.EventId, EventName = req.EventName,
+            var reg = new EventRegistration
+            {
+                EventId = req.EventId,
+                EventName = req.EventName,
                 RegStatus = "Pending",
-                ContactName = req.ContactName, ContactEmail = req.ContactEmail,
+                ContactName = req.ContactName,
+                ContactEmail = req.ContactEmail,
                 ContactPhone = req.ContactPhone,
-                SubmittedAt = DateTime.UtcNow, CreatedAt = DateTime.UtcNow,
+                SubmittedAt = DateTime.UtcNow,
+                CreatedAt = DateTime.UtcNow,
                 // legacy fields
-                TotalAmount = req.Payment.Amount, Currency = req.Payment.Currency,
+                TotalAmount = req.Payment.Amount,
+                Currency = req.Payment.Currency,
                 RegistrationStatus = "P",
             };
             _db.EventRegistrations.Add(reg);
@@ -82,10 +92,15 @@ public class RegistrationsController : ControllerBase
             for (int gi = 0; gi < req.Groups.Count; gi++)
             {
                 var gDto = req.Groups[gi];
-                var group = new ParticipantGroup {
-                    RegistrationId = reg.RegistrationId, EventId = req.EventId,
-                    ProgramId = gDto.ProgramId, ProgramName = gDto.ProgramName,
-                    Fee = gDto.Fee, GroupStatus = "Pending", CreatedAt = DateTime.UtcNow,
+                var group = new ParticipantGroup
+                {
+                    RegistrationId = reg.RegistrationId,
+                    EventId = req.EventId,
+                    ProgramId = gDto.ProgramId,
+                    ProgramName = gDto.ProgramName,
+                    Fee = gDto.Fee,
+                    GroupStatus = "Pending",
+                    CreatedAt = DateTime.UtcNow,
                 };
                 _db.ParticipantGroups.Add(group);
                 await _db.SaveChangesAsync();   // get GroupId
@@ -93,14 +108,21 @@ public class RegistrationsController : ControllerBase
                 var parts = new List<TrsParticipant>();
                 foreach (var pDto in gDto.Participants)
                 {
-                    var p = new TrsParticipant {
-                        GroupId = group.GroupId, FullName = pDto.FullName,
+                    var p = new TrsParticipant
+                    {
+                        GroupId = group.GroupId,
+                        FullName = pDto.FullName,
                         DateOfBirth = pDto.Dob != null ? DateOnly.Parse(pDto.Dob) : null,
-                        Gender = pDto.Gender, Nationality = pDto.Nationality,
-                        ClubSchoolCompany = pDto.ClubSchoolCompany, Email = pDto.Email,
-                        ContactNumber = pDto.ContactNumber, TshirtSize = pDto.TshirtSize,
-                        SbaId = pDto.SbaId, GuardianName = pDto.GuardianName,
-                        GuardianContact = pDto.GuardianContact, Remark = pDto.Remark,
+                        Gender = pDto.Gender,
+                        Nationality = pDto.Nationality,
+                        ClubSchoolCompany = pDto.ClubSchoolCompany,
+                        Email = pDto.Email,
+                        ContactNumber = pDto.ContactNumber,
+                        TshirtSize = pDto.TshirtSize,
+                        SbaId = pDto.SbaId,
+                        GuardianName = pDto.GuardianName,
+                        GuardianContact = pDto.GuardianContact,
+                        Remark = pDto.Remark,
                         CreatedAt = DateTime.UtcNow,
                     };
                     _db.TrsParticipants.Add(p);
@@ -112,13 +134,16 @@ public class RegistrationsController : ControllerBase
                 for (int pi = 0; pi < gDto.Participants.Count; pi++)
                     foreach (var (key, val) in gDto.Participants[pi].CustomFieldValues)
                         if (int.TryParse(key, out var cfId))
-                            _db.ParticipantCustomFieldValues.Add(new ParticipantCustomFieldValue {
-                                ParticipantId = parts[pi].ParticipantId, CustomFieldId = cfId,
-                                FieldLabel = key, FieldValue = val,
+                            _db.ParticipantCustomFieldValues.Add(new ParticipantCustomFieldValue
+                            {
+                                ParticipantId = parts[pi].ParticipantId,
+                                CustomFieldId = cfId,
+                                FieldLabel = key,
+                                FieldValue = val,
                             });
 
                 // display fields
-                group.ClubDisplay  = parts.FirstOrDefault()?.ClubSchoolCompany ?? "";
+                group.ClubDisplay = parts.FirstOrDefault()?.ClubSchoolCompany ?? "";
                 group.NamesDisplay = string.Join(" / ", parts.Select(p => p.FullName));
 
                 // payment items for this group
@@ -128,11 +153,17 @@ public class RegistrationsController : ControllerBase
                     if (iDto.ParticipantIndex.HasValue && iDto.ParticipantIndex < parts.Count)
                         participantId = parts[iDto.ParticipantIndex.Value].ParticipantId;
 
-                    allItems.Add(new PaymentItem {
-                        GroupId = group.GroupId, EventId = req.EventId, ProgramId = gDto.ProgramId,
-                        ProgramName = iDto.ProgramName, Description = iDto.Description,
-                        PlayerName = iDto.PlayerName, Amount = iDto.Amount,
-                        ItemStatus = "P", CreatedAt = DateTime.UtcNow,
+                    allItems.Add(new PaymentItem
+                    {
+                        GroupId = group.GroupId,
+                        EventId = req.EventId,
+                        ProgramId = gDto.ProgramId,
+                        ProgramName = iDto.ProgramName,
+                        Description = iDto.Description,
+                        PlayerName = iDto.PlayerName,
+                        Amount = iDto.Amount,
+                        ItemStatus = "P",
+                        CreatedAt = DateTime.UtcNow,
                         ParticipantId = participantId,
                     });
                 }
@@ -140,11 +171,16 @@ public class RegistrationsController : ControllerBase
             }
 
             // Payment record
-            var payment = new Payment {
-                RegistrationId = reg.RegistrationId, EventId = req.EventId,
-                PaymentGateway = req.Payment.Gateway, PaymentMethod = req.Payment.Method,
-                Amount = req.Payment.Amount, Currency = req.Payment.Currency,
-                PaymentStatus = "P", CreatedAt = DateTime.UtcNow,
+            var payment = new Payment
+            {
+                RegistrationId = reg.RegistrationId,
+                EventId = req.EventId,
+                PaymentGateway = req.Payment.Gateway,
+                PaymentMethod = req.Payment.Method,
+                Amount = req.Payment.Amount,
+                Currency = req.Payment.Currency,
+                PaymentStatus = "P",
+                CreatedAt = DateTime.UtcNow,
             };
             _db.Payments.Add(payment);
             await _db.SaveChangesAsync();
@@ -224,15 +260,17 @@ public class RegistrationsController : ControllerBase
             .FirstOrDefaultAsync(p => p.RegistrationId == id);
         if (payment == null) return NotFound(new { code = "NOT_FOUND", message = "Payment not found." });
 
-        if (req.Method != null)        payment.PaymentMethod  = req.Method;
-        if (req.PaymentStatus != null) payment.PaymentStatus  = req.PaymentStatus;
-        if (req.ReceiptNo != null)     payment.ReceiptNumber   = req.ReceiptNo;
+        if (req.Method != null) payment.PaymentMethod = req.Method;
+        if (req.PaymentStatus != null) payment.PaymentStatus = req.PaymentStatus;
+        if (req.ReceiptNo != null) payment.ReceiptNumber = req.ReceiptNo;
 
-        if (req.PaymentStatus == "S") {
+        if (req.PaymentStatus == "S")
+        {
             payment.PaidAt = DateTime.UtcNow;
-            if (string.IsNullOrEmpty(payment.ReceiptNumber)) {
+            if (string.IsNullOrEmpty(payment.ReceiptNumber))
+            {
                 var d = DateTime.UtcNow;
-                payment.ReceiptNumber = $"TRS-{d:yyyyMMdd}-{new Random().Next(10000,99999)}";
+                payment.ReceiptNumber = $"TRS-{d:yyyyMMdd}-{new Random().Next(10000, 99999)}";
             }
             foreach (var item in payment.Items) item.ItemStatus = "S";
 
@@ -244,10 +282,14 @@ public class RegistrationsController : ControllerBase
         await _db.SaveChangesAsync();
 
         // Audit log
-        _db.PaymentAuditLogs.Add(new PaymentAuditLog {
-            EntityType = "Payment", EntityId = payment.PaymentId,
-            Action = "ManualPaymentConfirmed", NewStatus = req.PaymentStatus,
-            Reason = req.AdminNote, PerformedBy = User.Identity?.Name ?? "admin",
+        _db.PaymentAuditLogs.Add(new PaymentAuditLog
+        {
+            EntityType = "Payment",
+            EntityId = payment.PaymentId,
+            Action = "ManualPaymentConfirmed",
+            NewStatus = req.PaymentStatus,
+            Reason = req.AdminNote,
+            PerformedBy = User.Identity?.Name ?? "admin",
             IpAddress = HttpContext.Connection.RemoteIpAddress?.ToString(),
             CreatedAt = DateTime.UtcNow,
         });
@@ -268,11 +310,18 @@ public class RegistrationsController : ControllerBase
             .OrderByDescending(r => r.CreatedAt)
             .ToListAsync();
         return Ok(refunds.Select(r => new {
-            id = r.RefundId.ToString(), paymentId = r.PaymentId.ToString(),
-            paymentItemId = r.PaymentItemId.ToString(), gateway = r.PaymentGateway,
-            gatewayRefundId = r.GatewayRefundId, r.RefundAmount, r.RefundReason,
-            refundStatus = r.RefundStatus, requestedBy = r.RequestedBy, approvedBy = r.ApprovedBy,
-            createdAt = r.CreatedAt, processedAt = r.ProcessedAt,
+            id = r.RefundId.ToString(),
+            paymentId = r.PaymentId.ToString(),
+            paymentItemId = r.PaymentItemId.ToString(),
+            gateway = r.PaymentGateway,
+            gatewayRefundId = r.GatewayRefundId,
+            r.RefundAmount,
+            r.RefundReason,
+            refundStatus = r.RefundStatus,
+            requestedBy = r.RequestedBy,
+            approvedBy = r.ApprovedBy,
+            createdAt = r.CreatedAt,
+            processedAt = r.ProcessedAt,
         }));
     }
 
@@ -293,18 +342,26 @@ public class RegistrationsController : ControllerBase
         if (req.RefundAmount > item.Amount)
             return BadRequest(new { code = "OVER_REFUND", message = $"Maximum refundable is {item.Amount}." });
 
-        var refund = new Refund {
-            PaymentId = payment.PaymentId, PaymentItemId = req.PaymentItemId,
+        var refund = new Refund
+        {
+            PaymentId = payment.PaymentId,
+            PaymentItemId = req.PaymentItemId,
             PaymentGateway = payment.PaymentGateway,
-            RefundAmount = req.RefundAmount, RefundReason = req.RefundReason,
-            RefundStatus = "P", RequestedBy = User.Identity?.Name ?? "admin",
+            RefundAmount = req.RefundAmount,
+            RefundReason = req.RefundReason,
+            RefundStatus = "P",
+            RequestedBy = User.Identity?.Name ?? "admin",
             CreatedAt = DateTime.UtcNow,
         };
         _db.Refunds.Add(refund);
 
-        _db.PaymentAuditLogs.Add(new PaymentAuditLog {
-            EntityType = "Refund", EntityId = 0, Action = "RefundInitiated",
-            Reason = req.RefundReason, PerformedBy = User.Identity?.Name ?? "admin",
+        _db.PaymentAuditLogs.Add(new PaymentAuditLog
+        {
+            EntityType = "Refund",
+            EntityId = 0,
+            Action = "RefundInitiated",
+            Reason = req.RefundReason,
+            PerformedBy = User.Identity?.Name ?? "admin",
             Notes = $"PaymentItemId={req.PaymentItemId}, Amount={req.RefundAmount}",
             CreatedAt = DateTime.UtcNow,
         });
@@ -320,7 +377,7 @@ public class RegistrationsController : ControllerBase
             .Include(r => r.ParticipantGroups).ThenInclude(g => g.Participants)
             .Include(r => r.Payments).ThenInclude(p => p.Items)
             .AsQueryable();
-        if (eventId.HasValue)   q = q.Where(r => r.EventId == eventId);
+        if (eventId.HasValue) q = q.Where(r => r.EventId == eventId);
         if (programId.HasValue) q = q.Where(r => r.ParticipantGroups.Any(g => g.ProgramId == programId));
         var items = await q.OrderByDescending(r => r.SubmittedAt).ToListAsync();
         return Ok(items.Select(MapReg));
@@ -333,16 +390,44 @@ public class RegistrationsController : ControllerBase
         var q = _db.EventRegistrations.Include(r => r.Payments).AsQueryable();
         if (eventId.HasValue) q = q.Where(r => r.EventId == eventId);
         var all = await q.ToListAsync();
-        return Ok(new {
+        return Ok(new
+        {
             totalRegistrations = all.Count,
-            confirmed    = all.Count(r => r.RegStatus == "Confirmed"),
-            pending      = all.Count(r => r.RegStatus == "Pending"),
-            cancelled    = all.Count(r => r.RegStatus == "Cancelled"),
-            waitlisted   = all.Count(r => r.RegStatus == "Waitlisted"),
+            confirmed = all.Count(r => r.RegStatus == "Confirmed"),
+            pending = all.Count(r => r.RegStatus == "Pending"),
+            cancelled = all.Count(r => r.RegStatus == "Cancelled"),
+            waitlisted = all.Count(r => r.RegStatus == "Waitlisted"),
             totalRevenue = all.Where(r => r.Payments.Any(p => p.PaymentStatus == "S"))
                              .Sum(r => r.Payments.Where(p => p.PaymentStatus == "S").Sum(p => p.Amount)),
             pendingPayments = all.Count(r => r.Payments.Any(p => p.PaymentStatus == "P")),
         });
+    }
+
+    // ── GET /api/registrations/:id/receipt  ── public ─────────────────────────
+    // Returns a PDF receipt. Always reflects current refund state.
+    // "Public" intentionally — the registration ID acts as the access token.
+    // The browser triggers a file download via Content-Disposition: attachment.
+    [HttpGet("{id:int}/receipt")]
+    public async Task<IActionResult> GetReceipt(int id)
+    {
+        try
+        {
+            var bytes = await _receipt.GenerateAsync(_db, id);
+            var reg = await _db.EventRegistrations
+                .Include(r => r.Payments)
+                .FirstOrDefaultAsync(r => r.RegistrationId == id);
+            var receiptNo = reg?.Payments.FirstOrDefault()?.ReceiptNumber ?? $"TRS-{id:D6}";
+            return File(bytes, "application/pdf", $"Receipt-{receiptNo}.pdf");
+        }
+        catch (KeyNotFoundException)
+        {
+            return NotFound(new { code = "NOT_FOUND", message = "Registration not found." });
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "Error generating receipt for registration {Id}", id);
+            return StatusCode(500, new { code = "RECEIPT_ERROR", message = "Failed to generate receipt." });
+        }
     }
 
     // ── Load helper ──────────────────────────────────────────────────────────
@@ -353,18 +438,31 @@ public class RegistrationsController : ControllerBase
             .FirstOrDefaultAsync(r => r.RegistrationId == id);
 
     // ── Map helpers ──────────────────────────────────────────────────────────
-    private static object MapPayment(Payment p) => new {
-        id = p.PaymentId.ToString(), registrationId = p.RegistrationId.ToString(),
-        eventId = p.EventId.ToString(), gateway = p.PaymentGateway, method = p.PaymentMethod,
-        amount = p.Amount, currency = p.Currency, paymentStatus = p.PaymentStatus,
-        receiptNo = p.ReceiptNumber, gatewaySessionId = p.GatewaySessionId,
-        gatewayPaymentId = p.GatewayPaymentId, gatewayChargeId = p.GatewayChargeId,
-        createdAt = p.CreatedAt, paidAt = p.PaidAt,
+    private static object MapPayment(Payment p) => new
+    {
+        id = p.PaymentId.ToString(),
+        registrationId = p.RegistrationId.ToString(),
+        eventId = p.EventId.ToString(),
+        gateway = p.PaymentGateway,
+        method = p.PaymentMethod,
+        amount = p.Amount,
+        currency = p.Currency,
+        paymentStatus = p.PaymentStatus,
+        receiptNo = p.ReceiptNumber,
+        gatewaySessionId = p.GatewaySessionId,
+        gatewayPaymentId = p.GatewayPaymentId,
+        gatewayChargeId = p.GatewayChargeId,
+        createdAt = p.CreatedAt,
+        paidAt = p.PaidAt,
         items = p.Items.Select(i => new {
-            id = i.PaymentItemId.ToString(), paymentId = i.PaymentId.ToString(),
+            id = i.PaymentItemId.ToString(),
+            paymentId = i.PaymentId.ToString(),
             participantGroupId = i.GroupId.ToString(),
             participantId = i.ParticipantId?.ToString(),
-            i.ProgramName, i.Description, i.PlayerName, i.Amount,
+            i.ProgramName,
+            i.Description,
+            i.PlayerName,
+            i.Amount,
             itemStatus = i.ItemStatus,
         }).ToList()
     };
@@ -372,22 +470,44 @@ public class RegistrationsController : ControllerBase
     private static object MapReg(EventRegistration r)
     {
         var payment = r.Payments.FirstOrDefault();
-        return new {
-            id = r.RegistrationId.ToString(), eventId = r.EventId.ToString(),
-            eventName = r.EventName, submittedAt = r.SubmittedAt,
-            regStatus = r.RegStatus, contactName = r.ContactName,
-            contactEmail = r.ContactEmail, contactPhone = r.ContactPhone,
+        return new
+        {
+            id = r.RegistrationId.ToString(),
+            eventId = r.EventId.ToString(),
+            eventName = r.EventName,
+            submittedAt = r.SubmittedAt,
+            regStatus = r.RegStatus,
+            contactName = r.ContactName,
+            contactEmail = r.ContactEmail,
+            contactPhone = r.ContactPhone,
             groups = r.ParticipantGroups.Select(g => new {
-                id = g.GroupId.ToString(), registrationId = r.RegistrationId.ToString(),
-                eventId = g.EventId.ToString(), programId = g.ProgramId.ToString(),
-                g.ProgramName, g.Fee, groupStatus = g.GroupStatus, g.Seed,
-                clubDisplay = g.ClubDisplay ?? "", namesDisplay = g.NamesDisplay ?? "",
+                id = g.GroupId.ToString(),
+                registrationId = r.RegistrationId.ToString(),
+                eventId = g.EventId.ToString(),
+                programId = g.ProgramId.ToString(),
+                g.ProgramName,
+                g.Fee,
+                groupStatus = g.GroupStatus,
+                g.Seed,
+                clubDisplay = g.ClubDisplay ?? "",
+                namesDisplay = g.NamesDisplay ?? "",
                 participants = g.Participants.Select(p => new {
-                    id = p.ParticipantId.ToString(), participantGroupId = g.GroupId.ToString(),
-                    p.FullName, dob = p.DateOfBirth?.ToString("yyyy-MM-dd") ?? "",
-                    p.Gender, p.Nationality, p.ClubSchoolCompany, p.Email, p.ContactNumber,
-                    p.TshirtSize, p.SbaId, p.GuardianName, p.GuardianContact,
-                    p.DocumentUrl, p.Remark, customFieldValues = new Dictionary<string, string>(),
+                    id = p.ParticipantId.ToString(),
+                    participantGroupId = g.GroupId.ToString(),
+                    p.FullName,
+                    dob = p.DateOfBirth?.ToString("yyyy-MM-dd") ?? "",
+                    p.Gender,
+                    p.Nationality,
+                    p.ClubSchoolCompany,
+                    p.Email,
+                    p.ContactNumber,
+                    p.TshirtSize,
+                    p.SbaId,
+                    p.GuardianName,
+                    p.GuardianContact,
+                    p.DocumentUrl,
+                    p.Remark,
+                    customFieldValues = new Dictionary<string, string>(),
                 }).ToList()
             }).ToList(),
             payment = payment == null ? null : MapPayment(payment)

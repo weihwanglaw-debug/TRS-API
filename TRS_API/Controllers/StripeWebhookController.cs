@@ -174,25 +174,61 @@ namespace TRS_API.Controllers
                         return;
                     }
 
+                    // Read payment method from session metadata (set during checkout creation)
+                    session.Metadata.TryGetValue("payment_method", out var paymentMethodMeta);
+                    var paymentMethod = paymentMethodMeta ?? "CreditCard";
+
                     // ✅ CREATE PAYMENT RECORD NOW (only after successful Stripe payment)
                     var payment = new Payment
                     {
                         RegistrationId = registrationId,
+                        EventId = registration.EventId,
                         Amount = registration.TotalAmount,
                         Currency = registration.Currency,
-                        PaymentGateway = "stripe",
-                        PaymentMethod = "card",
+                        PaymentGateway = "Stripe",
+                        PaymentMethod = paymentMethod,   // "CreditCard" or "PayNow"
                         PaymentStatus = "S", // ✅ Successful
                         GatewaySessionId = session.Id,
                         GatewayPaymentId = session.PaymentIntentId,
                         PaidAt = DateTime.UtcNow,
-                        CreatedAt = DateTime.UtcNow
+                        CreatedAt = DateTime.UtcNow,
+                        ReceiptNumber = $"TRS-{DateTime.UtcNow:yyyyMMdd}-{new Random().Next(10000, 99999):D5}",
                     };
 
                     _db.Payments.Add(payment);
+                    await _db.SaveChangesAsync();   // get PaymentId before creating items
 
-                    // ✅ Update registration status
+                    // ✅ Flip all PaymentItems for this registration → S
+                    var paymentItems = await _db.PaymentItems
+                        .Where(pi => pi.GroupId != 0 &&
+                               _db.ParticipantGroups
+                                  .Where(g => g.RegistrationId == registrationId)
+                                  .Select(g => g.GroupId)
+                                  .Contains(pi.GroupId))
+                        .ToListAsync();
+
+                    foreach (var item in paymentItems)
+                    {
+                        item.ItemStatus = "S";
+                        item.PaymentId = payment.PaymentId;   // link items to the new payment
+                        item.UpdatedAt = DateTime.UtcNow;
+                    }
+
+                    // ✅ Update registration statuses (both fields for compat)
                     registration.RegistrationStatus = "C";
+                    registration.RegStatus = "Confirmed";
+                    registration.UpdatedAt = DateTime.UtcNow;
+                    registration.ConfirmedAt = DateTime.UtcNow;
+
+                    // ✅ Flip all ParticipantGroups for this registration → Confirmed
+                    var groups = await _db.ParticipantGroups
+                        .Where(g => g.RegistrationId == registrationId)
+                        .ToListAsync();
+                    foreach (var g in groups)
+                    {
+                        g.GroupStatus = "Confirmed";
+                        g.UpdatedAt = DateTime.UtcNow;
+                    }
 
                     // Log webhook
                     var webhookLog = new WebhookLog
@@ -221,20 +257,31 @@ namespace TRS_API.Controllers
 
                     await transaction.CommitAsync();
 
-                    // Queue background job for email/receipt
+                    // Queue background job: generate receipt + send confirmation email
+                    var paymentIdForJob = payment.PaymentId;
+                    var regIdForJob = registrationId;
                     await _jobQueue.EnqueueAsync(async ct =>
                     {
                         using var scope = _serviceScopeFactory.CreateScope();
+                        var receiptSvc = scope.ServiceProvider.GetRequiredService<ReceiptService>();
                         var emailSvc = scope.ServiceProvider.GetRequiredService<EmailService>();
+                        var jobDb = scope.ServiceProvider.GetRequiredService<TRSDbContext>();
 
                         try
                         {
-                            // await emailSvc.SendPaymentConfirmationAsync(payment.PaymentId, ct);
-                            _logger.LogInformation("Payment confirmation queued for {PaymentId}", payment.PaymentId);
+                            // Generate PDF receipt
+                            var pdfBytes = await receiptSvc.GenerateAsync(jobDb, regIdForJob);
+                            _logger.LogInformation(
+                                "Receipt generated ({Bytes} bytes) for registration {RegId}",
+                                pdfBytes.Length, regIdForJob);
+
+                            // TODO: attach pdfBytes to confirmation email
+                            // await emailSvc.SendPaymentConfirmationAsync(regIdForJob, pdfBytes, ct);
                         }
                         catch (Exception ex)
                         {
-                            _logger.LogError(ex, "Failed to send payment confirmation for {PaymentId}", payment.PaymentId);
+                            _logger.LogError(ex,
+                                "Failed to generate receipt for payment {PaymentId}", paymentIdForJob);
                         }
                     });
 
