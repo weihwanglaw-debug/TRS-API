@@ -33,7 +33,7 @@ public class EventsController : ControllerBase
     }
 
     // POST /api/events  — admin
-    [HttpPost, Authorize]
+    [HttpPost, Authorize(Roles = "superadmin,eventadmin")]
     public async Task<IActionResult> Create([FromBody] UpsertEventRequest req)
     {
         var ev = ApplyEventFields(new Event { CreatedAt = DateTime.UtcNow, IsActive = true }, req);
@@ -43,7 +43,7 @@ public class EventsController : ControllerBase
     }
 
     // PUT /api/events/:id  — admin
-    [HttpPut("{id:int}"), Authorize]
+    [HttpPut("{id:int}"), Authorize(Roles = "superadmin,eventadmin")]
     public async Task<IActionResult> Update(int id, [FromBody] UpsertEventRequest req)
     {
         var ev = await _db.Events.Include(e => e.GalleryImages).FirstOrDefaultAsync(e => e.EventId == id);
@@ -56,7 +56,7 @@ public class EventsController : ControllerBase
     }
 
     // DELETE /api/events/:id  — admin
-    [HttpDelete("{id:int}"), Authorize]
+    [HttpDelete("{id:int}"), Authorize(Roles = "superadmin,eventadmin")]
     public async Task<IActionResult> Delete(int id)
     {
         var ev = await _db.Events.FindAsync(id);
@@ -67,7 +67,7 @@ public class EventsController : ControllerBase
     }
 
     // POST /api/events/:id/programs  — admin
-    [HttpPost("{id:int}/programs"), Authorize]
+    [HttpPost("{id:int}/programs"), Authorize(Roles = "superadmin,eventadmin")]
     public async Task<IActionResult> AddProgram(int id, [FromBody] UpsertProgramRequest req)
     {
         if (!await _db.Events.AnyAsync(e => e.EventId == id))
@@ -79,7 +79,7 @@ public class EventsController : ControllerBase
     }
 
     // PUT /api/events/:eid/programs/:pid  — admin
-    [HttpPut("{eid:int}/programs/{pid:int}"), Authorize]
+    [HttpPut("{eid:int}/programs/{pid:int}"), Authorize(Roles = "superadmin,eventadmin")]
     public async Task<IActionResult> UpdateProgram(int eid, int pid, [FromBody] UpsertProgramRequest req)
     {
         var prog = await _db.Programs.Include(p => p.Fields).Include(p => p.CustomFields)
@@ -93,7 +93,7 @@ public class EventsController : ControllerBase
     }
 
     // DELETE /api/events/:eid/programs/:pid  — admin
-    [HttpDelete("{eid:int}/programs/{pid:int}"), Authorize]
+    [HttpDelete("{eid:int}/programs/{pid:int}"), Authorize(Roles = "superadmin,eventadmin")]
     public async Task<IActionResult> DeleteProgram(int eid, int pid)
     {
         var prog = await _db.Programs.FirstOrDefaultAsync(p => p.ProgramId == pid && p.EventId == eid);
@@ -125,7 +125,7 @@ public class EventsController : ControllerBase
         ev.Name = r.Name; ev.Description = r.Description; ev.Venue = r.Venue;
         ev.VenueAddress = r.VenueAddress; ev.BannerUrl = r.BannerUrl; ev.ProspectusUrl = r.ProspectusUrl;
         ev.EventStartDate = DateOnly.Parse(r.EventStartDate);
-        ev.EventEndDate   = r.EventEndDate != null ? DateOnly.Parse(r.EventEndDate) : null;
+        ev.EventEndDate = r.EventEndDate != null ? DateOnly.Parse(r.EventEndDate) : null;
         ev.OpenDate = DateOnly.Parse(r.OpenDate); ev.CloseDate = DateOnly.Parse(r.CloseDate);
         ev.MaxParticipants = r.MaxParticipants; ev.SponsorInfo = r.SponsorInfo;
         ev.ConsentStatement = r.ConsentStatement; ev.IsSports = r.IsSports;
@@ -142,43 +142,95 @@ public class EventsController : ControllerBase
         p.FeeStructure = r.FeeStructure; p.SbaRequired = r.SbaRequired;
         p.MinPlayers = r.MinPlayers; p.MaxPlayers = r.MaxPlayers;
         p.MinParticipants = r.MinParticipants; p.MaxParticipants = r.MaxParticipants;
-        if (p.Fields != null) {
+        if (p.Fields != null)
+        {
             p.Fields.EnableSbaId = r.Fields.EnableSbaId; p.Fields.EnableDocumentUpload = r.Fields.EnableDocumentUpload;
             p.Fields.EnableGuardianInfo = r.Fields.EnableGuardianInfo; p.Fields.EnableRemark = r.Fields.EnableRemark;
-        } else {
-            p.Fields = new ProgramField { EnableSbaId = r.Fields.EnableSbaId, EnableDocumentUpload = r.Fields.EnableDocumentUpload,
-                EnableGuardianInfo = r.Fields.EnableGuardianInfo, EnableRemark = r.Fields.EnableRemark };
         }
-        p.CustomFields = r.Fields.CustomFields.Select((cf, i) => new ProgramCustomField {
-            Label = cf.Label, FieldType = cf.FieldType, IsRequired = cf.IsRequired,
-            Options = cf.Options, SortOrder = i }).ToList();
+        else
+        {
+            p.Fields = new ProgramField
+            {
+                EnableSbaId = r.Fields.EnableSbaId,
+                EnableDocumentUpload = r.Fields.EnableDocumentUpload,
+                EnableGuardianInfo = r.Fields.EnableGuardianInfo,
+                EnableRemark = r.Fields.EnableRemark
+            };
+        }
+        p.CustomFields = r.Fields.CustomFields.Select((cf, i) => new ProgramCustomField
+        {
+            Label = cf.Label,
+            FieldType = cf.FieldType,
+            IsRequired = cf.IsRequired,
+            Options = cf.Options,
+            SortOrder = i
+        }).ToList();
         return p;
     }
 
-    private static object MapProgram(TrsProgram p, int currentParticipants) => new {
-        id = p.ProgramId.ToString(), p.Name, p.Type, p.MinAge, p.MaxAge, p.Gender,
-        p.Fee, p.PaymentRequired, p.FeeStructure, p.SbaRequired,
-        p.MinPlayers, p.MaxPlayers, p.MinParticipants, p.MaxParticipants,
-        currentParticipants, p.Status, participantSeeds = new List<object>(),
-        fields = p.Fields == null ? (object)new { enableSbaId=false, enableDocumentUpload=false,
-            enableGuardianInfo=false, enableRemark=false, customFields=new List<object>() }
-        : new { enableSbaId=p.Fields.EnableSbaId, enableDocumentUpload=p.Fields.EnableDocumentUpload,
-            enableGuardianInfo=p.Fields.EnableGuardianInfo, enableRemark=p.Fields.EnableRemark,
-            customFields=p.CustomFields.OrderBy(cf=>cf.SortOrder).Select(cf => (object)new {
-                label=cf.Label, type=cf.FieldType, required=cf.IsRequired, options=cf.Options }).ToList() }
+    private static object MapProgram(TrsProgram p, int currentParticipants) => new
+    {
+        id = p.ProgramId.ToString(),
+        p.Name,
+        p.Type,
+        p.MinAge,
+        p.MaxAge,
+        p.Gender,
+        p.Fee,
+        p.PaymentRequired,
+        p.FeeStructure,
+        p.SbaRequired,
+        p.MinPlayers,
+        p.MaxPlayers,
+        p.MinParticipants,
+        p.MaxParticipants,
+        currentParticipants,
+        p.Status,
+        participantSeeds = new List<object>(),
+        fields = p.Fields == null ? (object)new
+        {
+            enableSbaId = false,
+            enableDocumentUpload = false,
+            enableGuardianInfo = false,
+            enableRemark = false,
+            customFields = new List<object>()
+        }
+        : new
+        {
+            enableSbaId = p.Fields.EnableSbaId,
+            enableDocumentUpload = p.Fields.EnableDocumentUpload,
+            enableGuardianInfo = p.Fields.EnableGuardianInfo,
+            enableRemark = p.Fields.EnableRemark,
+            customFields = p.CustomFields.OrderBy(cf => cf.SortOrder).Select(cf => (object)new
+            {
+                label = cf.Label,
+                type = cf.FieldType,
+                required = cf.IsRequired,
+                options = cf.Options
+            }).ToList()
+        }
     };
 
-    private static object MapEvent(Event ev, Dictionary<int, int> counts) => new {
-        id = ev.EventId.ToString(), ev.Name, ev.Description, ev.Venue, ev.VenueAddress,
-        bannerUrl = ev.BannerUrl ?? "", prospectusUrl = ev.ProspectusUrl ?? "",
+    private static object MapEvent(Event ev, Dictionary<int, int> counts) => new
+    {
+        id = ev.EventId.ToString(),
+        ev.Name,
+        ev.Description,
+        ev.Venue,
+        ev.VenueAddress,
+        bannerUrl = ev.BannerUrl ?? "",
+        prospectusUrl = ev.ProspectusUrl ?? "",
         galleryUrls = ev.GalleryImages.OrderBy(g => g.SortOrder).Select(g => g.ImageUrl).ToList(),
         eventStartDate = ev.EventStartDate.ToString("yyyy-MM-dd"),
-        eventEndDate   = ev.EventEndDate?.ToString("yyyy-MM-dd") ?? "",
-        openDate  = ev.OpenDate.ToString("yyyy-MM-dd"),
+        eventEndDate = ev.EventEndDate?.ToString("yyyy-MM-dd") ?? "",
+        openDate = ev.OpenDate.ToString("yyyy-MM-dd"),
         closeDate = ev.CloseDate.ToString("yyyy-MM-dd"),
-        ev.MaxParticipants, sponsorInfo = ev.SponsorInfo ?? "",
+        ev.MaxParticipants,
+        sponsorInfo = ev.SponsorInfo ?? "",
         consentStatement = ev.ConsentStatement ?? "",
-        ev.IsSports, sportType = ev.SportType ?? "", ev.FixtureMode,
+        ev.IsSports,
+        sportType = ev.SportType ?? "",
+        ev.FixtureMode,
         programs = ev.Programs.Where(p => p.IsActive)
             .Select(p => MapProgram(p, counts.GetValueOrDefault(p.ProgramId, 0))).ToList()
     };

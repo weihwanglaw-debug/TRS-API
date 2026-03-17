@@ -17,7 +17,7 @@ public class RegistrationsController : ControllerBase
         => (_db, _log, _receipt) = (db, log, receipt);
 
     // ── GET /api/registrations  ── admin, paged + filtered ─────────────────
-    [HttpGet, Authorize]
+    [HttpGet, Authorize(Roles = "superadmin,eventadmin")]
     public async Task<IActionResult> GetAll(
         [FromQuery] int? eventId, [FromQuery] int? programId,
         [FromQuery] string? regStatus, [FromQuery] string? payStatus,
@@ -92,6 +92,68 @@ public class RegistrationsController : ControllerBase
             for (int gi = 0; gi < req.Groups.Count; gi++)
             {
                 var gDto = req.Groups[gi];
+
+                // ── Capacity check (race-condition safe) ──────────────────────
+                // Lock the program row so concurrent requests can't both pass.
+                var program = await _db.Programs
+                    .FromSqlRaw(
+                        "SELECT * FROM Programs WITH (UPDLOCK, ROWLOCK) WHERE ProgramID = {0}",
+                        gDto.ProgramId)
+                    .FirstOrDefaultAsync();
+
+                if (program == null)
+                {
+                    await tx.RollbackAsync();
+                    return NotFound(new
+                    {
+                        code = "PROGRAM_NOT_FOUND",
+                        message = $"Program '{gDto.ProgramName}' not found."
+                    });
+                }
+
+                if (!program.IsActive || program.Status == "closed")
+                {
+                    await tx.RollbackAsync();
+                    return BadRequest(new
+                    {
+                        code = "PROGRAM_CLOSED",
+                        message = $"'{gDto.ProgramName}' is no longer accepting registrations."
+                    });
+                }
+
+                // Count active groups (Pending + Confirmed, not Cancelled/Waitlisted)
+                var activeGroupCount = await _db.ParticipantGroups
+                    .CountAsync(g => g.ProgramId == gDto.ProgramId
+                        && g.GroupStatus != "Cancelled"
+                        && g.GroupStatus != "Waitlisted");
+
+                if (activeGroupCount >= program.MaxParticipants)
+                {
+                    await tx.RollbackAsync();
+                    return BadRequest(new
+                    {
+                        code = "PROGRAM_FULL",
+                        message = $"'{gDto.ProgramName}' is full. No slots remaining."
+                    });
+                }
+
+                // ── Duplicate check ───────────────────────────────────────────
+                // Prevent the same contact email from submitting the same program twice.
+                var isDuplicate = await _db.ParticipantGroups
+                    .AnyAsync(g => g.ProgramId == gDto.ProgramId
+                        && g.GroupStatus != "Cancelled"
+                        && g.Registration.ContactEmail == req.ContactEmail);
+
+                if (isDuplicate)
+                {
+                    await tx.RollbackAsync();
+                    return BadRequest(new
+                    {
+                        code = "DUPLICATE_REGISTRATION",
+                        message = $"'{req.ContactEmail}' is already registered for '{gDto.ProgramName}'."
+                    });
+                }
+
                 var group = new ParticipantGroup
                 {
                     RegistrationId = reg.RegistrationId,
@@ -202,7 +264,7 @@ public class RegistrationsController : ControllerBase
     }
 
     // ── PATCH /api/registrations/:id/status  ── admin ──────────────────────
-    [HttpPatch("{id:int}/status"), Authorize]
+    [HttpPatch("{id:int}/status"), Authorize(Roles = "superadmin,eventadmin")]
     public async Task<IActionResult> UpdateStatus(int id, [FromBody] UpdateRegStatusRequest req)
     {
         var reg = await _db.EventRegistrations.FindAsync(id);
@@ -217,7 +279,7 @@ public class RegistrationsController : ControllerBase
     }
 
     // ── PATCH /api/registrations/:id/groups/:gid/status  ── admin ──────────
-    [HttpPatch("{id:int}/groups/{gid:int}/status"), Authorize]
+    [HttpPatch("{id:int}/groups/{gid:int}/status"), Authorize(Roles = "superadmin,eventadmin")]
     public async Task<IActionResult> UpdateGroupStatus(int id, int gid, [FromBody] UpdateRegStatusRequest req)
     {
         var group = await _db.ParticipantGroups
@@ -230,7 +292,7 @@ public class RegistrationsController : ControllerBase
     }
 
     // ── PATCH /api/registrations/:id/groups/:gid/seed  ── admin ─────────────
-    [HttpPatch("{id:int}/groups/{gid:int}/seed"), Authorize]
+    [HttpPatch("{id:int}/groups/{gid:int}/seed"), Authorize(Roles = "superadmin,eventadmin")]
     public async Task<IActionResult> UpdateGroupSeed(int id, int gid, [FromBody] UpdateSeedRequest req)
     {
         var group = await _db.ParticipantGroups
@@ -243,7 +305,7 @@ public class RegistrationsController : ControllerBase
     }
 
     // ── GET /api/registrations/:id/payment  ── admin ───────────────────────
-    [HttpGet("{id:int}/payment"), Authorize]
+    [HttpGet("{id:int}/payment"), Authorize(Roles = "superadmin,eventadmin")]
     public async Task<IActionResult> GetPayment(int id)
     {
         var payment = await _db.Payments.Include(p => p.Items)
@@ -253,7 +315,7 @@ public class RegistrationsController : ControllerBase
     }
 
     // ── PATCH /api/registrations/:id/payment  ── admin (manual confirm) ────
-    [HttpPatch("{id:int}/payment"), Authorize]
+    [HttpPatch("{id:int}/payment"), Authorize(Roles = "superadmin,eventadmin")]
     public async Task<IActionResult> UpdatePayment(int id, [FromBody] UpdatePaymentManualRequest req)
     {
         var payment = await _db.Payments.Include(p => p.Items)
@@ -300,7 +362,7 @@ public class RegistrationsController : ControllerBase
     }
 
     // ── GET /api/registrations/:id/payment/refunds  ── admin ───────────────
-    [HttpGet("{id:int}/payment/refunds"), Authorize]
+    [HttpGet("{id:int}/payment/refunds"), Authorize(Roles = "superadmin,eventadmin")]
     public async Task<IActionResult> GetRefunds(int id)
     {
         var payment = await _db.Payments.FirstOrDefaultAsync(p => p.RegistrationId == id);
@@ -326,7 +388,7 @@ public class RegistrationsController : ControllerBase
     }
 
     // ── POST /api/registrations/:id/payment/refunds  ── admin ──────────────
-    [HttpPost("{id:int}/payment/refunds"), Authorize]
+    [HttpPost("{id:int}/payment/refunds"), Authorize(Roles = "superadmin,eventadmin")]
     public async Task<IActionResult> InitiateRefund(int id, [FromBody] InitiateRefundRequest req)
     {
         var payment = await _db.Payments.Include(p => p.Items)
@@ -370,7 +432,7 @@ public class RegistrationsController : ControllerBase
     }
 
     // ── GET /api/registrations/export  ── admin ─────────────────────────────
-    [HttpGet("export"), Authorize]
+    [HttpGet("export"), Authorize(Roles = "superadmin,eventadmin")]
     public async Task<IActionResult> Export([FromQuery] int? eventId, [FromQuery] int? programId)
     {
         var q = _db.EventRegistrations
@@ -384,7 +446,7 @@ public class RegistrationsController : ControllerBase
     }
 
     // ── GET /api/registrations/stats  ── admin ──────────────────────────────
-    [HttpGet("stats"), Authorize]
+    [HttpGet("stats"), Authorize(Roles = "superadmin,eventadmin")]
     public async Task<IActionResult> Stats([FromQuery] int? eventId)
     {
         var q = _db.EventRegistrations.Include(r => r.Payments).AsQueryable();

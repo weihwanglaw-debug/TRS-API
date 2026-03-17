@@ -7,11 +7,11 @@ using TRS_Data.Models;
 
 namespace TRS_API.Controllers;
 
-[ApiController, Route("api/admin/users"), Authorize]
+[ApiController, Route("api/admin/users"), Authorize(Roles = "superadmin")]
 public class UsersController : ControllerBase
 {
     private readonly TRSDbContext _db;
-    private readonly AuthService  _auth;
+    private readonly AuthService _auth;
 
     public UsersController(TRSDbContext db, AuthService auth) => (_db, _auth) = (db, auth);
 
@@ -19,8 +19,14 @@ public class UsersController : ControllerBase
     [HttpGet]
     public async Task<IActionResult> GetAll() =>
         Ok(await _db.AdminUsers.Where(u => u.IsActive)
-            .Select(u => new { id = u.UserId.ToString(), u.Email, u.Name, u.Role,
-                               lastLogin = u.LastLogin, u.MustChangePassword })
+            .Select(u => new {
+                id = u.UserId.ToString(),
+                u.Email,
+                u.Name,
+                u.Role,
+                lastLogin = u.LastLogin,
+                u.MustChangePassword
+            })
             .ToListAsync());
 
     // POST /api/admin/users
@@ -30,11 +36,15 @@ public class UsersController : ControllerBase
         if (await _db.AdminUsers.AnyAsync(u => u.Email == req.Email))
             return BadRequest(new { code = "EMAIL_TAKEN", message = "Email already in use." });
 
-        var user = new AdminUser {
-            Email = req.Email, Name = req.Name, Role = req.Role,
+        var user = new AdminUser
+        {
+            Email = req.Email,
+            Name = req.Name,
+            Role = req.Role,
             PasswordHash = _auth.HashPassword(req.Password),
             MustChangePassword = req.MustChangePassword,
-            IsActive = true, CreatedAt = DateTime.UtcNow,
+            IsActive = true,
+            CreatedAt = DateTime.UtcNow,
         };
         _db.AdminUsers.Add(user);
         await _db.SaveChangesAsync();
@@ -49,7 +59,8 @@ public class UsersController : ControllerBase
         if (user == null || !user.IsActive)
             return NotFound(new { code = "NOT_FOUND", message = "User not found." });
 
-        if (req.Email != null && req.Email != user.Email) {
+        if (req.Email != null && req.Email != user.Email)
+        {
             if (await _db.AdminUsers.AnyAsync(u => u.Email == req.Email && u.UserId != id))
                 return BadRequest(new { code = "EMAIL_TAKEN", message = "Email already in use." });
             user.Email = req.Email;

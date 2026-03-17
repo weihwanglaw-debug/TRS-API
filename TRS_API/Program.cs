@@ -10,7 +10,12 @@ using TRS_Data.Models;
 var builder = WebApplication.CreateBuilder(args);
 
 // ── Services ──────────────────────────────────────────────────────────────────
-builder.Services.AddControllers();
+builder.Services.AddControllers(options =>
+{
+    // Automatically return 400 ValidationProblem for any [Required], [EmailAddress],
+    // [MinLength], [Range] etc. annotation failures — no manual ModelState checks needed.
+    options.Filters.Add<TRS_API.Filters.ValidateModelFilter>();
+});
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(c => {
     c.AddSecurityDefinition("Bearer", new Microsoft.OpenApi.Models.OpenApiSecurityScheme
@@ -48,6 +53,9 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
             ValidIssuer = builder.Configuration["Jwt:Issuer"],
             ValidAudience = builder.Configuration["Jwt:Audience"],
             IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtSecret)),
+            // Map ClaimTypes.Role so [Authorize(Roles=...)] works correctly
+            RoleClaimType = System.Security.Claims.ClaimTypes.Role,
+            ClockSkew = TimeSpan.FromMinutes(2),  // small tolerance for clock drift
         };
     });
 builder.Services.AddAuthorization();
