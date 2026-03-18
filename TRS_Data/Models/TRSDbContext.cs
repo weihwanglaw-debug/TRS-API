@@ -17,10 +17,9 @@ public partial class TRSDbContext : DbContext
     public virtual DbSet<SbaRanking>                 SbaRankings                { get; set; }
     public virtual DbSet<EventRegistration>          EventRegistrations         { get; set; }
     public virtual DbSet<ParticipantGroup>           ParticipantGroups          { get; set; }
-    public virtual DbSet<TrsParticipant>             TrsParticipants            { get; set; }
+    public virtual DbSet<Participant>             Participants            { get; set; }
     public virtual DbSet<ParticipantCustomFieldValue> ParticipantCustomFieldValues { get; set; }
     public virtual DbSet<EventParticipant>           EventParticipants          { get; set; }
-    public virtual DbSet<Participant>                Participants               { get; set; }
     public virtual DbSet<Payment>                    Payments                   { get; set; }
     public virtual DbSet<PaymentItem>                PaymentItems               { get; set; }
     public virtual DbSet<Refund>                     Refunds                    { get; set; }
@@ -40,6 +39,7 @@ public partial class TRSDbContext : DbContext
     {
         // SystemConfig
         mb.Entity<SystemConfig>(e => {
+            e.ToTable("SystemConfig");
             e.HasKey(x => x.ConfigKey);
             e.Property(x => x.ConfigKey).HasMaxLength(50).IsUnicode(false);
             e.Property(x => x.UpdatedAt).HasDefaultValueSql("(sysutcdatetime())");
@@ -137,7 +137,7 @@ public partial class TRSDbContext : DbContext
         // SbaRankings
         mb.Entity<SbaRanking>(e => {
             e.HasKey(x => x.SbaId).HasName("PK_SbaRankings");
-            e.Property(x => x.SbaId).HasMaxLength(20).IsUnicode(false);
+            e.Property(x => x.SbaId).HasColumnName("SbaID").HasMaxLength(20).IsUnicode(false);
             e.Property(x => x.Name).HasMaxLength(200);
             e.Property(x => x.Club).HasMaxLength(200);
             e.Property(x => x.Gender).HasMaxLength(10).IsUnicode(false);
@@ -186,8 +186,8 @@ public partial class TRSDbContext : DbContext
              .HasForeignKey(x => x.ProgramId).HasConstraintName("FK_ParticipantGroups_Program");
         });
 
-        // TrsParticipants (table name Participants)
-        mb.Entity<TrsParticipant>(e => {
+        // Participants (table name Participants)
+        mb.Entity<Participant>(e => {
             e.ToTable("Participants");
             e.HasKey(x => x.ParticipantId).HasName("PK_Participants");
             e.Property(x => x.ParticipantId).HasColumnName("ParticipantID");
@@ -345,7 +345,10 @@ public partial class TRSDbContext : DbContext
 
         // BackgroundJobs
         mb.Entity<BackgroundJob>(e => {
+            e.ToTable("BackgroundJobs");
             e.HasKey(x => x.JobId).HasName("PK__Backgrou__056690C218EA13AF");
+            e.Property(x => x.JobId).HasColumnName("JobID");
+            e.Property(x => x.ReferenceId).HasColumnName("ReferenceID");
             e.Property(x => x.JobType).HasMaxLength(100);
             e.Property(x => x.ReferenceType).HasMaxLength(50);
             e.Property(x => x.JobStatus).HasMaxLength(1).IsUnicode(false).IsFixedLength().HasDefaultValue("P");
@@ -356,6 +359,7 @@ public partial class TRSDbContext : DbContext
 
         // PaymentAuditLog
         mb.Entity<PaymentAuditLog>(e => {
+            e.ToTable("PaymentAuditLog");
             e.HasKey(x => x.AuditId).HasName("PK_PaymentAuditLog");
             e.Property(x => x.AuditId).HasColumnName("AuditID");
             e.Property(x => x.EntityType).HasMaxLength(20).IsUnicode(false);
@@ -370,6 +374,7 @@ public partial class TRSDbContext : DbContext
 
         // AdminAuditLog
         mb.Entity<AdminAuditLog>(e => {
+            e.ToTable("AdminAuditLog");
             e.HasKey(x => x.AuditId).HasName("PK_AdminAuditLog");
             e.Property(x => x.AuditId).HasColumnName("AuditID");
             e.Property(x => x.UserId).HasColumnName("UserID");

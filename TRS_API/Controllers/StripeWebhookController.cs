@@ -192,7 +192,7 @@ namespace TRS_API.Controllers
                         GatewayPaymentId = session.PaymentIntentId,
                         PaidAt = DateTime.UtcNow,
                         CreatedAt = DateTime.UtcNow,
-                        ReceiptNumber = $"TRS-{DateTime.UtcNow:yyyyMMdd}-{new Random().Next(10000, 99999):D5}",
+                        ReceiptNumber = $"TRS-{DateTime.UtcNow:yyyyMMdd}-{Random.Shared.Next(10000, 99999):D5}",
                     };
 
                     _db.Payments.Add(payment);

@@ -167,10 +167,10 @@ public class RegistrationsController : ControllerBase
                 _db.ParticipantGroups.Add(group);
                 await _db.SaveChangesAsync();   // get GroupId
 
-                var parts = new List<TrsParticipant>();
+                var parts = new List<Participant>();
                 foreach (var pDto in gDto.Participants)
                 {
-                    var p = new TrsParticipant
+                    var p = new Participant
                     {
                         GroupId = group.GroupId,
                         FullName = pDto.FullName,
@@ -187,7 +187,7 @@ public class RegistrationsController : ControllerBase
                         Remark = pDto.Remark,
                         CreatedAt = DateTime.UtcNow,
                     };
-                    _db.TrsParticipants.Add(p);
+                    _db.Participants.Add(p);
                     parts.Add(p);
                 }
                 await _db.SaveChangesAsync();   // get ParticipantIds
@@ -332,7 +332,7 @@ public class RegistrationsController : ControllerBase
             if (string.IsNullOrEmpty(payment.ReceiptNumber))
             {
                 var d = DateTime.UtcNow;
-                payment.ReceiptNumber = $"TRS-{d:yyyyMMdd}-{new Random().Next(10000, 99999)}";
+                payment.ReceiptNumber = $"TRS-{d:yyyyMMdd}-{Random.Shared.Next(10000, 99999)}";
             }
             foreach (var item in payment.Items) item.ItemStatus = "S";
 

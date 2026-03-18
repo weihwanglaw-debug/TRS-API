@@ -12,12 +12,17 @@ public class EventsController : ControllerBase
     private readonly TRSDbContext _db;
     public EventsController(TRSDbContext db) => _db = db;
 
-    // GET /api/events  — public
+    // GET /api/events  — public (active only); ?includeInactive=true requires admin
     [HttpGet]
-    public async Task<IActionResult> GetAll()
+    public async Task<IActionResult> GetAll([FromQuery] bool includeInactive = false)
     {
-        var events = await LoadEvents().Where(e => e.IsActive)
-            .OrderByDescending(e => e.EventStartDate).ToListAsync();
+        // Only admins can see inactive events
+        if (includeInactive && !User.IsInRole("superadmin") && !User.IsInRole("eventadmin"))
+            includeInactive = false;
+
+        var q = LoadEvents();
+        if (!includeInactive) q = q.Where(e => e.IsActive);
+        var events = await q.OrderByDescending(e => e.EventStartDate).ToListAsync();
         var counts = await GetParticipantCounts(events.SelectMany(e => e.Programs.Select(p => p.ProgramId)).ToList());
         return Ok(events.Select(e => MapEvent(e, counts)));
     }

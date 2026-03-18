@@ -6,6 +6,6 @@ public partial class ParticipantCustomFieldValue
     public int CustomFieldId { get; set; }
     public string FieldLabel { get; set; } = null!;    // snapshotted label
     public string? FieldValue { get; set; }
-    public virtual TrsParticipant Participant { get; set; } = null!;
+    public virtual Participant Participant { get; set; } = null!;
     public virtual ProgramCustomField CustomField { get; set; } = null!;
 }

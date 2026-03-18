@@ -32,7 +32,7 @@ public class ConfigController : ControllerBase
     }
 
     // PUT /api/config  — admin
-    [HttpPut, Authorize]
+    [HttpPut, Authorize(Roles = "superadmin")]
     public async Task<IActionResult> Update([FromBody] UpdateConfigRequest req)
     {
         foreach (var (key, value) in req.Updates)

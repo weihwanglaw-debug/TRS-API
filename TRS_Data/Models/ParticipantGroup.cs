@@ -16,6 +16,6 @@ public partial class ParticipantGroup
     public virtual EventRegistration Registration { get; set; } = null!;
     public virtual Event Event { get; set; } = null!;
     public virtual TrsProgram Program { get; set; } = null!;
-    public virtual ICollection<TrsParticipant> Participants { get; set; } = new List<TrsParticipant>();
+    public virtual ICollection<Participant> Participants { get; set; } = new List<Participant>();
     public virtual ICollection<PaymentItem> PaymentItems { get; set; } = new List<PaymentItem>();
 }

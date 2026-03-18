@@ -22,12 +22,25 @@ public class PaymentCleanupWorker : BackgroundService
                 .Where(p => p.PaymentStatus == "P" && p.CreatedAt < DateTime.UtcNow.AddHours(-24))
                 .ToListAsync(stoppingToken);
 
-            foreach (var p in expired) {
-                p.PaymentStatus = "X";    // 'X' = Cancelled/expired per schema
-                p.UpdatedAt = DateTime.UtcNow;
-            }
-
             if (expired.Any()) {
+                var expiredRegIds = expired.Select(p => p.RegistrationId).ToList();
+
+                // Also cancel the associated registrations
+                var regs = await db.EventRegistrations
+                    .Where(r => expiredRegIds.Contains(r.RegistrationId)
+                             && r.RegStatus == "Pending")
+                    .ToListAsync(stoppingToken);
+
+                foreach (var p in expired) {
+                    p.PaymentStatus = "X";
+                    p.UpdatedAt = DateTime.UtcNow;
+                }
+                foreach (var r in regs) {
+                    r.RegStatus = "Cancelled";
+                    r.RegistrationStatus = "X";
+                    r.UpdatedAt = DateTime.UtcNow;
+                }
+
                 await db.SaveChangesAsync(stoppingToken);
                 _logger.LogInformation("Expired {Count} stale pending payments → status X", expired.Count);
             }
