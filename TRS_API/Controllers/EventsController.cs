@@ -27,11 +27,14 @@ public class EventsController : ControllerBase
         return Ok(events.Select(e => MapEvent(e, counts)));
     }
 
-    // GET /api/events/:id  — public
+    // GET /api/events/:id  — public (active only); requires admin if inactive
     [HttpGet("{id:int}")]
     public async Task<IActionResult> GetById(int id)
     {
-        var ev = await LoadEvents().FirstOrDefaultAsync(e => e.EventId == id && e.IsActive);
+        var isAdmin = User.IsInRole("superadmin") || User.IsInRole("eventadmin");
+        var q = LoadEvents().Where(e => e.EventId == id);
+        if (!isAdmin) q = q.Where(e => e.IsActive);
+        var ev = await q.FirstOrDefaultAsync();
         if (ev == null) return NotFound(new { code = "NOT_FOUND", message = "Event not found." });
         var counts = await GetParticipantCounts(ev.Programs.Select(p => p.ProgramId).ToList());
         return Ok(MapEvent(ev, counts));

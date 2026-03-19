@@ -18,17 +18,7 @@ public class ConfigController : ControllerBase
     {
         var rows = await _db.SystemConfigs.ToListAsync();
         var dict = rows.ToDictionary(r => r.ConfigKey, r => r.ConfigValue);
-        return Ok(new {
-            appName       = dict.GetValueOrDefault("appName",       "TRS"),
-            logoUrl       = dict.GetValueOrDefault("logoUrl",       ""),
-            heroTitle     = dict.GetValueOrDefault("heroTitle",     ""),
-            heroSubtitle  = dict.GetValueOrDefault("heroSubtitle",  ""),
-            heroImageUrl  = dict.GetValueOrDefault("heroImageUrl",  ""),
-            currency      = dict.GetValueOrDefault("currency",      "SGD"),
-            contactEmail  = dict.GetValueOrDefault("contactEmail",  ""),
-            copyrightText = dict.GetValueOrDefault("copyrightText", ""),
-            consentText   = dict.GetValueOrDefault("consentText",   ""),
-        });
+        return Ok(dict);
     }
 
     // PUT /api/config  — admin

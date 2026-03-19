@@ -25,7 +25,7 @@ public class RegistrationsController : ControllerBase
         [FromQuery] int page = 1, [FromQuery] int pageSize = 50)
     {
         var q = _db.EventRegistrations
-            .Include(r => r.ParticipantGroups).ThenInclude(g => g.Participants)
+            .Include(r => r.ParticipantGroups).ThenInclude(g => g.Participants).ThenInclude(p => p.CustomFieldValues)
             .Include(r => r.Payments).ThenInclude(p => p.Items)
             .AsQueryable();
 
@@ -436,7 +436,7 @@ public class RegistrationsController : ControllerBase
     public async Task<IActionResult> Export([FromQuery] int? eventId, [FromQuery] int? programId)
     {
         var q = _db.EventRegistrations
-            .Include(r => r.ParticipantGroups).ThenInclude(g => g.Participants)
+            .Include(r => r.ParticipantGroups).ThenInclude(g => g.Participants).ThenInclude(p => p.CustomFieldValues)
             .Include(r => r.Payments).ThenInclude(p => p.Items)
             .AsQueryable();
         if (eventId.HasValue) q = q.Where(r => r.EventId == eventId);
@@ -496,6 +496,7 @@ public class RegistrationsController : ControllerBase
     private Task<EventRegistration?> LoadReg(int id) =>
         _db.EventRegistrations
             .Include(r => r.ParticipantGroups).ThenInclude(g => g.Participants)
+            .ThenInclude(p => p.CustomFieldValues)
             .Include(r => r.Payments).ThenInclude(p => p.Items)
             .FirstOrDefaultAsync(r => r.RegistrationId == id);
 
@@ -569,7 +570,7 @@ public class RegistrationsController : ControllerBase
                     p.GuardianContact,
                     p.DocumentUrl,
                     p.Remark,
-                    customFieldValues = new Dictionary<string, string>(),
+                    customFieldValues = p.CustomFieldValues.ToDictionary(cf => cf.CustomFieldId.ToString(), cf => cf.FieldValue ?? ""),
                 }).ToList()
             }).ToList(),
             payment = payment == null ? null : MapPayment(payment)

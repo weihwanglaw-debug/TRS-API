@@ -28,7 +28,13 @@ public class SbaController : ControllerBase
     {
         var r = await _db.SbaRankings.FindAsync(sbaId);
         if (r == null) return NotFound(new { code = "NOT_FOUND", message = "SBA member not found." });
-        return Ok(new { r.SbaId, r.Name, r.Club, r.AccumulatedScore, r.Ranking, r.DateOfBirth });
+        return Ok(new {
+            sbaId  = r.SbaId,
+            name   = r.Name,
+            club   = r.Club,
+            dob    = r.DateOfBirth?.ToString("yyyy-MM-dd") ?? "",
+            gender = r.Gender ?? "",
+        });
     }
 
     // GET /api/sba/members?name=  — public
