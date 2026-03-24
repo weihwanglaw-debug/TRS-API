@@ -126,6 +126,30 @@ namespace TRS_API.Controllers
 
         private async Task HandleCheckoutCompleted(Session session, string eventId)
         {
+            // ── Session-first flow: DB write is handled by confirm-session endpoint ──
+            // The frontend calls POST /api/Payment/confirm-session after Stripe redirects
+            // back. Nothing for the webhook to do for these sessions.
+            if (session.Metadata.TryGetValue("flow", out var flow) && flow == "session_first")
+            {
+                _logger.LogInformation(
+                    "Webhook: session-first session {SessionId} completed — DB write handled by confirm-session",
+                    session.Id);
+
+                _db.WebhookLogs.Add(new WebhookLog
+                {
+                    PaymentGateway = "stripe",
+                    GatewayEventId = eventId,
+                    EventType      = "checkout.session.completed",
+                    PayloadJson    = System.Text.Json.JsonSerializer.Serialize(session),
+                    ProcessingStatus = "I",   // I = informational, no action taken
+                    ReceivedAt     = DateTime.UtcNow,
+                    ProcessedAt    = DateTime.UtcNow
+                });
+                await _db.SaveChangesAsync();
+                return;
+            }
+
+            // ── Legacy flow: registration already in DB, update payment status ──
             // Check deduplication FIRST
             var existingLog = await _db.WebhookLogs
                 .FirstOrDefaultAsync(e => e.GatewayEventId == eventId && e.ProcessingStatus == "S");
@@ -144,7 +168,6 @@ namespace TRS_API.Controllers
                 using var transaction = await _db.Database.BeginTransactionAsync();
                 try
                 {
-                    // ✅ Get registration ID from session metadata
                     if (!session.Metadata.TryGetValue("registration_id", out var regIdStr) ||
                         !int.TryParse(regIdStr, out var registrationId))
                     {
@@ -163,7 +186,6 @@ namespace TRS_API.Controllers
                         return;
                     }
 
-                    // ✅ Check if payment already exists (deduplication)
                     var existingPayment = await _db.Payments
                         .FirstOrDefaultAsync(p => p.GatewaySessionId == session.Id);
 
@@ -174,31 +196,28 @@ namespace TRS_API.Controllers
                         return;
                     }
 
-                    // Read payment method from session metadata (set during checkout creation)
                     session.Metadata.TryGetValue("payment_method", out var paymentMethodMeta);
                     var paymentMethod = paymentMethodMeta ?? "CreditCard";
 
-                    // ✅ CREATE PAYMENT RECORD NOW (only after successful Stripe payment)
                     var payment = new Payment
                     {
-                        RegistrationId = registrationId,
-                        EventId = registration.EventId,
-                        Amount = registration.TotalAmount,
-                        Currency = registration.Currency,
-                        PaymentGateway = "Stripe",
-                        PaymentMethod = paymentMethod,   // "CreditCard" or "PayNow"
-                        PaymentStatus = "S", // ✅ Successful
+                        RegistrationId   = registrationId,
+                        EventId          = registration.EventId,
+                        Amount           = registration.TotalAmount,
+                        Currency         = registration.Currency,
+                        PaymentGateway   = "Stripe",
+                        PaymentMethod    = paymentMethod,
+                        PaymentStatus    = "S",
                         GatewaySessionId = session.Id,
                         GatewayPaymentId = session.PaymentIntentId,
-                        PaidAt = DateTime.UtcNow,
-                        CreatedAt = DateTime.UtcNow,
-                        ReceiptNumber = $"TRS-{DateTime.UtcNow:yyyyMMdd}-{Random.Shared.Next(10000, 99999):D5}",
+                        PaidAt           = DateTime.UtcNow,
+                        CreatedAt        = DateTime.UtcNow,
+                        ReceiptNumber    = $"TRS-{DateTime.UtcNow:yyyyMMdd}-{Random.Shared.Next(10000, 99999):D5}",
                     };
 
                     _db.Payments.Add(payment);
-                    await _db.SaveChangesAsync();   // get PaymentId before creating items
+                    await _db.SaveChangesAsync();
 
-                    // ✅ Flip all PaymentItems for this registration → S
                     var paymentItems = await _db.PaymentItems
                         .Where(pi => pi.GroupId != 0 &&
                                _db.ParticipantGroups
@@ -210,44 +229,32 @@ namespace TRS_API.Controllers
                     foreach (var item in paymentItems)
                     {
                         item.ItemStatus = "S";
-                        item.PaymentId = payment.PaymentId;   // link items to the new payment
-                        item.UpdatedAt = DateTime.UtcNow;
+                        item.PaymentId  = payment.PaymentId;
+                        item.UpdatedAt  = DateTime.UtcNow;
                     }
 
-                    // ✅ Update registration statuses (both fields for compat)
                     registration.RegistrationStatus = "C";
-                    registration.RegStatus = "Confirmed";
-                    registration.UpdatedAt = DateTime.UtcNow;
-                    registration.ConfirmedAt = DateTime.UtcNow;
+                    registration.RegStatus          = "Confirmed";
+                    registration.UpdatedAt          = DateTime.UtcNow;
+                    registration.ConfirmedAt        = DateTime.UtcNow;
 
-                    // ✅ Flip all ParticipantGroups for this registration → Confirmed
                     var groups = await _db.ParticipantGroups
                         .Where(g => g.RegistrationId == registrationId)
                         .ToListAsync();
-                    foreach (var g in groups)
-                    {
-                        g.GroupStatus = "Confirmed";
-                        g.UpdatedAt = DateTime.UtcNow;
-                    }
+                    foreach (var g in groups) { g.GroupStatus = "Confirmed"; g.UpdatedAt = DateTime.UtcNow; }
 
-                    // Log webhook
-                    var webhookLog = new WebhookLog
+                    _db.WebhookLogs.Add(new WebhookLog
                     {
-                        PaymentGateway = "stripe",
-                        GatewayEventId = eventId,
-                        EventType = "checkout.session.completed",
-                        PayloadJson = System.Text.Json.JsonSerializer.Serialize(session),
+                        PaymentGateway   = "stripe",
+                        GatewayEventId   = eventId,
+                        EventType        = "checkout.session.completed",
+                        PayloadJson      = System.Text.Json.JsonSerializer.Serialize(session),
                         ProcessingStatus = "S",
-                        ReceivedAt = DateTime.UtcNow,
-                        ProcessedAt = DateTime.UtcNow
-                    };
+                        ReceivedAt       = DateTime.UtcNow,
+                        ProcessedAt      = DateTime.UtcNow
+                    });
 
-                    _db.WebhookLogs.Add(webhookLog);
-
-                    try
-                    {
-                        await _db.SaveChangesAsync();
-                    }
+                    try { await _db.SaveChangesAsync(); }
                     catch (DbUpdateException ex) when (ex.InnerException?.Message.Contains("duplicate") == true)
                     {
                         _logger.LogInformation("Duplicate webhook detected during save: {EventId}", eventId);
@@ -257,38 +264,30 @@ namespace TRS_API.Controllers
 
                     await transaction.CommitAsync();
 
-                    // Queue background job: generate receipt + send confirmation email
                     var paymentIdForJob = payment.PaymentId;
-                    var regIdForJob = registrationId;
+                    var regIdForJob     = registrationId;
                     await _jobQueue.EnqueueAsync(async ct =>
                     {
-                        using var scope = _serviceScopeFactory.CreateScope();
-                        var receiptSvc = scope.ServiceProvider.GetRequiredService<ReceiptService>();
-                        var emailSvc = scope.ServiceProvider.GetRequiredService<EmailService>();
-                        var jobDb = scope.ServiceProvider.GetRequiredService<TRSDbContext>();
-
+                        using var scope     = _serviceScopeFactory.CreateScope();
+                        var receiptSvc      = scope.ServiceProvider.GetRequiredService<ReceiptService>();
+                        var emailSvc        = scope.ServiceProvider.GetRequiredService<EmailService>();
+                        var jobDb           = scope.ServiceProvider.GetRequiredService<TRSDbContext>();
                         try
                         {
-                            // Generate PDF receipt
                             var pdfBytes = await receiptSvc.GenerateAsync(jobDb, regIdForJob);
-                            _logger.LogInformation(
-                                "Receipt generated ({Bytes} bytes) for registration {RegId}",
+                            _logger.LogInformation("Receipt generated ({Bytes} bytes) for registration {RegId}",
                                 pdfBytes.Length, regIdForJob);
-
-                            // TODO: attach pdfBytes to confirmation email
-                            // await emailSvc.SendPaymentConfirmationAsync(regIdForJob, pdfBytes, ct);
+                            // TODO: await emailSvc.SendPaymentConfirmationAsync(regIdForJob, pdfBytes, ct);
                         }
                         catch (Exception ex)
                         {
-                            _logger.LogError(ex,
-                                "Failed to generate receipt for payment {PaymentId}", paymentIdForJob);
+                            _logger.LogError(ex, "Failed to generate receipt for payment {PaymentId}", paymentIdForJob);
                         }
                     });
 
-                    _logger.LogInformation("Successfully processed payment {PaymentId} for registration {RegId}",
+                    _logger.LogInformation("Successfully processed legacy payment {PaymentId} for registration {RegId}",
                         payment.PaymentId, registrationId);
-
-                    return; // Success - exit retry loop
+                    return;
                 }
                 catch (DbUpdateException ex) when (attempt < maxRetries - 1)
                 {
@@ -300,55 +299,53 @@ namespace TRS_API.Controllers
                 catch (Exception ex)
                 {
                     await transaction.RollbackAsync();
-
-                    // Log failure
                     try
                     {
                         _db.WebhookLogs.Add(new WebhookLog
                         {
-                            PaymentGateway = "stripe",
-                            GatewayEventId = eventId,
-                            EventType = "checkout.session.completed",
-                            PayloadJson = System.Text.Json.JsonSerializer.Serialize(session),
+                            PaymentGateway   = "stripe",
+                            GatewayEventId   = eventId,
+                            EventType        = "checkout.session.completed",
+                            PayloadJson      = System.Text.Json.JsonSerializer.Serialize(session),
                             ProcessingStatus = "F",
-                            ErrorMessage = ex.Message,
-                            ReceivedAt = DateTime.UtcNow,
-                            ProcessedAt = DateTime.UtcNow
+                            ErrorMessage     = ex.Message,
+                            ReceivedAt       = DateTime.UtcNow,
+                            ProcessedAt      = DateTime.UtcNow
                         });
                         await _db.SaveChangesAsync();
                     }
-                    catch (Exception logEx)
-                    {
-                        _logger.LogError(logEx, "Failed to log webhook error for {EventId}", eventId);
-                    }
-
+                    catch (Exception logEx) { _logger.LogError(logEx, "Failed to log webhook error"); }
                     throw;
                 }
             }
         }
 
-
         private async Task HandleCheckoutExpired(Session session, string eventId)
         {
+            // Session-first flow: no DB record was created, nothing to expire
+            if (session.Metadata.TryGetValue("flow", out var flow) && flow == "session_first")
+            {
+                _logger.LogInformation("Webhook: session-first session {SessionId} expired — no DB action needed", session.Id);
+                return;
+            }
+
+            // Legacy flow: cancel the pending payment if it exists
             try
             {
                 var payment = await _db.Payments.FirstOrDefaultAsync(p => p.GatewaySessionId == session.Id);
-
                 if (payment != null && payment.PaymentStatus == "P")
                 {
-                    payment.PaymentStatus = "X"; // Cancelled/expired
-
+                    payment.PaymentStatus = "X";
                     _db.WebhookLogs.Add(new WebhookLog
                     {
-                        PaymentGateway = "stripe",
-                        GatewayEventId = eventId,
-                        EventType = "checkout.session.expired",
-                        PayloadJson = System.Text.Json.JsonSerializer.Serialize(session),
+                        PaymentGateway   = "stripe",
+                        GatewayEventId   = eventId,
+                        EventType        = "checkout.session.expired",
+                        PayloadJson      = System.Text.Json.JsonSerializer.Serialize(session),
                         ProcessingStatus = "S",
-                        ReceivedAt = DateTime.UtcNow,
-                        ProcessedAt = DateTime.UtcNow
+                        ReceivedAt       = DateTime.UtcNow,
+                        ProcessedAt      = DateTime.UtcNow
                     });
-
                     await _db.SaveChangesAsync();
                 }
             }

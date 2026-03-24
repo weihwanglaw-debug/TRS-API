@@ -17,29 +17,23 @@ public class PaymentCleanupWorker : BackgroundService
             using var scope = _services.CreateScope();
             var db = scope.ServiceProvider.GetRequiredService<TRSDbContext>();
 
-            // Expire payments that have been Pending for >24h — status 'X' = Cancelled (not 'E')
+            // Only affects legacy flow (free registrations written to DB before payment).
+            // Session-first paid registrations never create a Pending payment record,
+            // so there is nothing to clean up for those.
             var expired = await db.Payments
                 .Where(p => p.PaymentStatus == "P" && p.CreatedAt < DateTime.UtcNow.AddHours(-24))
                 .ToListAsync(stoppingToken);
 
-            if (expired.Any()) {
+            if (expired.Any())
+            {
                 var expiredRegIds = expired.Select(p => p.RegistrationId).ToList();
 
-                // Also cancel the associated registrations
                 var regs = await db.EventRegistrations
-                    .Where(r => expiredRegIds.Contains(r.RegistrationId)
-                             && r.RegStatus == "Pending")
+                    .Where(r => expiredRegIds.Contains(r.RegistrationId) && r.RegStatus == "Pending")
                     .ToListAsync(stoppingToken);
 
-                foreach (var p in expired) {
-                    p.PaymentStatus = "X";
-                    p.UpdatedAt = DateTime.UtcNow;
-                }
-                foreach (var r in regs) {
-                    r.RegStatus = "Cancelled";
-                    r.RegistrationStatus = "X";
-                    r.UpdatedAt = DateTime.UtcNow;
-                }
+                foreach (var p in expired) { p.PaymentStatus = "X"; p.UpdatedAt = DateTime.UtcNow; }
+                foreach (var r in regs)    { r.RegStatus = "Cancelled"; r.RegistrationStatus = "X"; r.UpdatedAt = DateTime.UtcNow; }
 
                 await db.SaveChangesAsync(stoppingToken);
                 _logger.LogInformation("Expired {Count} stale pending payments → status X", expired.Count);
