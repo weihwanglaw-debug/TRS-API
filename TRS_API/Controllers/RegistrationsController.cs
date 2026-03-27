@@ -323,10 +323,21 @@ public class RegistrationsController : ControllerBase
         if (payment == null) return NotFound(new { code = "NOT_FOUND", message = "Payment not found." });
 
         if (req.Method != null) payment.PaymentMethod = req.Method;
-        if (req.PaymentStatus != null) payment.PaymentStatus = req.PaymentStatus;
+        if (req.PaymentStatus != null) {
+            // Accept both frontend label ("Success") and DB code ("S")
+            payment.PaymentStatus = req.PaymentStatus switch {
+                "Success"          => "S",
+                "Pending"          => "P",
+                "Failed"           => "F",
+                "Cancelled"        => "X",
+                "PartiallyRefunded"=> "PR",
+                "FullyRefunded"    => "FR",
+                _ => req.PaymentStatus  // already a DB code
+            };
+        }
         if (req.ReceiptNo != null) payment.ReceiptNumber = req.ReceiptNo;
 
-        if (req.PaymentStatus == "S")
+        if (payment.PaymentStatus == "S")
         {
             payment.PaidAt = DateTime.UtcNow;
             if (string.IsNullOrEmpty(payment.ReceiptNumber))
@@ -510,7 +521,15 @@ public class RegistrationsController : ControllerBase
         method = p.PaymentMethod,
         amount = p.Amount,
         currency = p.Currency,
-        paymentStatus = p.PaymentStatus,
+        paymentStatus = p.PaymentStatus switch {
+            "P"  => "Pending",
+            "S"  => "Success",
+            "PR" => "PartiallyRefunded",
+            "FR" => "FullyRefunded",
+            "F"  => "Failed",
+            "X"  => "Cancelled",
+            _    => p.PaymentStatus
+        },
         receiptNo = p.ReceiptNumber,
         gatewaySessionId = p.GatewaySessionId,
         gatewayPaymentId = p.GatewayPaymentId,
@@ -526,7 +545,12 @@ public class RegistrationsController : ControllerBase
             i.Description,
             i.PlayerName,
             i.Amount,
-            itemStatus = i.ItemStatus,
+            itemStatus = i.ItemStatus switch {
+                "P" => "Pending",
+                "S" => "Success",
+                "R" => "Refunded",
+                _   => i.ItemStatus
+            },
         }).ToList()
     };
 

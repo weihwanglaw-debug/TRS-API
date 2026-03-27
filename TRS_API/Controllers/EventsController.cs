@@ -154,6 +154,7 @@ public class EventsController : ControllerBase
         {
             p.Fields.EnableSbaId = r.Fields.EnableSbaId; p.Fields.EnableDocumentUpload = r.Fields.EnableDocumentUpload;
             p.Fields.EnableGuardianInfo = r.Fields.EnableGuardianInfo; p.Fields.EnableRemark = r.Fields.EnableRemark;
+            p.Fields.EnableTshirt = r.Fields.EnableTshirt;
         }
         else
         {
@@ -162,7 +163,8 @@ public class EventsController : ControllerBase
                 EnableSbaId = r.Fields.EnableSbaId,
                 EnableDocumentUpload = r.Fields.EnableDocumentUpload,
                 EnableGuardianInfo = r.Fields.EnableGuardianInfo,
-                EnableRemark = r.Fields.EnableRemark
+                EnableRemark = r.Fields.EnableRemark,
+                EnableTshirt = r.Fields.EnableTshirt
             };
         }
         p.CustomFields = r.Fields.CustomFields.Select((cf, i) => new ProgramCustomField
@@ -201,6 +203,7 @@ public class EventsController : ControllerBase
             enableDocumentUpload = false,
             enableGuardianInfo = false,
             enableRemark = false,
+            enableTshirt = false,
             customFields = new List<object>()
         }
         : new
@@ -209,6 +212,7 @@ public class EventsController : ControllerBase
             enableDocumentUpload = p.Fields.EnableDocumentUpload,
             enableGuardianInfo = p.Fields.EnableGuardianInfo,
             enableRemark = p.Fields.EnableRemark,
+            enableTshirt = p.Fields.EnableTshirt,
             customFields = p.CustomFields.OrderBy(cf => cf.SortOrder).Select(cf => (object)new
             {
                 label = cf.Label,

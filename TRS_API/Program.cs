@@ -15,6 +15,13 @@ builder.Services.AddControllers(options =>
     // Automatically return 400 ValidationProblem for any [Required], [EmailAddress],
     // [MinLength], [Range] etc. annotation failures — no manual ModelState checks needed.
     options.Filters.Add<TRS_API.Filters.ValidateModelFilter>();
+})
+.AddJsonOptions(options =>
+{
+    // Ensure all JSON responses use camelCase to match TypeScript frontend expectations.
+    // This covers shorthand property serialization (e.g. p.FullName -> "fullName").
+    options.JsonSerializerOptions.PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase;
+    options.JsonSerializerOptions.DictionaryKeyPolicy  = System.Text.Json.JsonNamingPolicy.CamelCase;
 });
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(c => {

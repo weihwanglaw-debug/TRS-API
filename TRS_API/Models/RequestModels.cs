@@ -81,6 +81,7 @@ public class ProgramFieldsDto
     public bool EnableDocumentUpload { get; set; }
     public bool EnableGuardianInfo { get; set; }
     public bool EnableRemark { get; set; }
+    public bool EnableTshirt { get; set; }
     public List<CustomFieldDto> CustomFields { get; set; } = new();
 }
 public class CustomFieldDto

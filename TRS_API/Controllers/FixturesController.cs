@@ -58,6 +58,23 @@ public class FixturesController : ControllerBase
         return Ok(new { eventId, programId, f.FixtureFormat, f.IsLocked, f.Phase });
     }
 
+    // GET /api/fixtures/status?programIds=1,2,3  — bulk existence check for dashboard/table
+    // Returns a dict of programId -> bool (true = fixture exists)
+    [HttpGet("status")]
+    public async Task<IActionResult> GetStatus([FromQuery] string programIds)
+    {
+        var ids = programIds.Split(',', StringSplitOptions.RemoveEmptyEntries)
+            .Select(s => int.TryParse(s.Trim(), out var n) ? n : -1)
+            .Where(n => n > 0).ToList();
+        if (!ids.Any()) return Ok(new Dictionary<string, bool>());
+        var existing = await _db.Fixtures
+            .Where(f => ids.Contains(f.ProgramId))
+            .Select(f => f.ProgramId)
+            .ToListAsync();
+        var result = ids.ToDictionary(id => id.ToString(), id => existing.Contains(id));
+        return Ok(result);
+    }
+
     // DELETE /api/fixtures/:eventId/:programId  — reset fixture
     [HttpDelete("{eventId:int}/{programId:int}")]
     public async Task<IActionResult> Delete(int eventId, int programId)
