@@ -2,6 +2,7 @@ using TRS_API.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using Stripe;
 using TRS_API.Models;
 using TRS_Data.Models;
 
@@ -33,7 +34,8 @@ public class RegistrationsController : ControllerBase
         if (programId.HasValue) q = q.Where(r => r.ParticipantGroups.Any(g => g.ProgramId == programId));
         if (!string.IsNullOrEmpty(regStatus)) q = q.Where(r => r.RegStatus == regStatus);
         if (!string.IsNullOrEmpty(payStatus))
-            q = q.Where(r => r.Payments.Any(p => p.PaymentStatus == payStatus));
+            // Translate long-form frontend code ("Success") → DB short code ("S") before filtering
+            q = q.Where(r => r.Payments.Any(p => p.PaymentStatus == PayStatusToDb(payStatus)));
         if (!string.IsNullOrEmpty(search))
             q = q.Where(r => r.ContactName.Contains(search) || r.ContactEmail.Contains(search)
                 || r.Payments.Any(p => p.ReceiptNumber!.Contains(search)));
@@ -68,6 +70,16 @@ public class RegistrationsController : ControllerBase
         using var tx = await _db.Database.BeginTransactionAsync();
         try
         {
+            // Pre-load custom fields for all programs in this registration so we can
+            // resolve label → CustomFieldId without N+1 queries inside the loop.
+            var programIds = req.Groups.Select(g => g.ProgramId).Distinct().ToList();
+            var customFieldsByProgram = await _db.ProgramCustomFields
+                .Where(cf => programIds.Contains(cf.ProgramId))
+                .GroupBy(cf => cf.ProgramId)
+                .ToDictionaryAsync(
+                    g => g.Key,
+                    g => g.ToDictionary(cf => cf.Label, cf => cf.CustomFieldId));
+
             var reg = new EventRegistration
             {
                 EventId = req.EventId,
@@ -94,7 +106,6 @@ public class RegistrationsController : ControllerBase
                 var gDto = req.Groups[gi];
 
                 // ── Capacity check (race-condition safe) ──────────────────────
-                // Lock the program row so concurrent requests can't both pass.
                 var program = await _db.Programs
                     .FromSqlRaw(
                         "SELECT * FROM Programs WITH (UPDLOCK, ROWLOCK) WHERE ProgramID = {0}",
@@ -121,7 +132,6 @@ public class RegistrationsController : ControllerBase
                     });
                 }
 
-                // Count active groups (Pending + Confirmed, not Cancelled/Waitlisted)
                 var activeGroupCount = await _db.ParticipantGroups
                     .CountAsync(g => g.ProgramId == gDto.ProgramId
                         && g.GroupStatus != "Cancelled"
@@ -138,7 +148,6 @@ public class RegistrationsController : ControllerBase
                 }
 
                 // ── Duplicate check ───────────────────────────────────────────
-                // Prevent the same contact email from submitting the same program twice.
                 var isDuplicate = await _db.ParticipantGroups
                     .AnyAsync(g => g.ProgramId == gDto.ProgramId
                         && g.GroupStatus != "Cancelled"
@@ -192,17 +201,32 @@ public class RegistrationsController : ControllerBase
                 }
                 await _db.SaveChangesAsync();   // get ParticipantIds
 
-                // custom field values
+                // ── Custom field values ───────────────────────────────────────
+                // Frontend sends { "Field Label": "value" } — resolve label → CustomFieldId
+                // using the pre-loaded lookup dict. FK requires a valid CustomFieldId.
+                var cfLookup = customFieldsByProgram.GetValueOrDefault(gDto.ProgramId)
+                               ?? new Dictionary<string, int>();
+
                 for (int pi = 0; pi < gDto.Participants.Count; pi++)
-                    foreach (var (key, val) in gDto.Participants[pi].CustomFieldValues)
-                        if (int.TryParse(key, out var cfId))
-                            _db.ParticipantCustomFieldValues.Add(new ParticipantCustomFieldValue
-                            {
-                                ParticipantId = parts[pi].ParticipantId,
-                                CustomFieldId = cfId,
-                                FieldLabel = key,
-                                FieldValue = val,
-                            });
+                {
+                    foreach (var (label, val) in gDto.Participants[pi].CustomFieldValues)
+                    {
+                        if (!cfLookup.TryGetValue(label, out var cfId))
+                        {
+                            _log.LogWarning(
+                                "Custom field label '{Label}' not found for program {ProgramId} — skipping",
+                                label, gDto.ProgramId);
+                            continue;   // skip unknown labels rather than saving orphaned rows
+                        }
+                        _db.ParticipantCustomFieldValues.Add(new ParticipantCustomFieldValue
+                        {
+                            ParticipantId = parts[pi].ParticipantId,
+                            CustomFieldId = cfId,
+                            FieldLabel    = label,
+                            FieldValue    = val,
+                        });
+                    }
+                }
 
                 // display fields
                 group.ClubDisplay = parts.FirstOrDefault()?.ClubSchoolCompany ?? "";
@@ -323,20 +347,15 @@ public class RegistrationsController : ControllerBase
         if (payment == null) return NotFound(new { code = "NOT_FOUND", message = "Payment not found." });
 
         if (req.Method != null) payment.PaymentMethod = req.Method;
-        if (req.PaymentStatus != null) {
-            // Accept both frontend label ("Success") and DB code ("S")
-            payment.PaymentStatus = req.PaymentStatus switch {
-                "Success"          => "S",
-                "Pending"          => "P",
-                "Failed"           => "F",
-                "Cancelled"        => "X",
-                "PartiallyRefunded"=> "PR",
-                "FullyRefunded"    => "FR",
-                _ => req.PaymentStatus  // already a DB code
-            };
-        }
+
+        // Translate long-form frontend status ("Success") → DB short code ("S")
+        // This also prevents truncation errors on the VARCHAR(2) column.
+        if (req.PaymentStatus != null)
+            payment.PaymentStatus = PayStatusToDb(req.PaymentStatus);
+
         if (req.ReceiptNo != null) payment.ReceiptNumber = req.ReceiptNo;
 
+        // payment.PaymentStatus is now always a short code — safe to compare with "S"
         if (payment.PaymentStatus == "S")
         {
             payment.PaidAt = DateTime.UtcNow;
@@ -360,7 +379,7 @@ public class RegistrationsController : ControllerBase
             EntityType = "Payment",
             EntityId = payment.PaymentId,
             Action = "ManualPaymentConfirmed",
-            NewStatus = req.PaymentStatus,
+            NewStatus = payment.PaymentStatus,   // store short code in audit log
             Reason = req.AdminNote,
             PerformedBy = User.Identity?.Name ?? "admin",
             IpAddress = HttpContext.Connection.RemoteIpAddress?.ToString(),
@@ -415,7 +434,7 @@ public class RegistrationsController : ControllerBase
         if (req.RefundAmount > item.Amount)
             return BadRequest(new { code = "OVER_REFUND", message = $"Maximum refundable is {item.Amount}." });
 
-        var refund = new Refund
+        var refund = new TRS_Data.Models.Refund
         {
             PaymentId = payment.PaymentId,
             PaymentItemId = req.PaymentItemId,
@@ -426,7 +445,51 @@ public class RegistrationsController : ControllerBase
             RequestedBy = User.Identity?.Name ?? "admin",
             CreatedAt = DateTime.UtcNow,
         };
+
+        try
+        {
+            if (payment.PaymentGateway == "Stripe")
+            {
+                var refundOptions = new RefundCreateOptions
+                {
+                    PaymentIntent = payment.GatewayPaymentId,
+                    Amount = (long)(req.RefundAmount * 100),
+                    Reason = "requested_by_customer",
+                    Metadata = new Dictionary<string, string>
+                    {
+                        ["registration_id"] = id.ToString(),
+                        ["payment_item_id"] = req.PaymentItemId.ToString(),
+                    }
+                };
+
+                var stripeRefund = await new RefundService().CreateAsync(refundOptions);
+                refund.GatewayRefundId = stripeRefund.Id;
+                refund.RefundStatus = stripeRefund.Status == "failed" ? "F" : "S";
+                refund.ProcessedAt = DateTime.UtcNow;
+            }
+            else
+            {
+                refund.RefundStatus = "S";
+                refund.ProcessedAt = DateTime.UtcNow;
+            }
+        }
+        catch (StripeException ex)
+        {
+            return BadRequest(new
+            {
+                code = ex.StripeError?.Code ?? "REFUND_FAILED",
+                message = ex.StripeError?.Message ?? "Refund failed."
+            });
+        }
+
         _db.Refunds.Add(refund);
+
+        if (refund.RefundStatus == "S")
+        {
+            item.ItemStatus = "R";
+            item.UpdatedAt = DateTime.UtcNow;
+            PaymentController.ApplyRefundOutcome(payment);
+        }
 
         _db.PaymentAuditLogs.Add(new PaymentAuditLog
         {
@@ -439,7 +502,13 @@ public class RegistrationsController : ControllerBase
             CreatedAt = DateTime.UtcNow,
         });
         await _db.SaveChangesAsync();
-        return Ok(new { id = refund.RefundId.ToString(), refund.RefundStatus, refund.RefundAmount });
+        return Ok(new
+        {
+            id = refund.RefundId.ToString(),
+            refundStatus = refund.RefundStatus,
+            refundAmount = refund.RefundAmount,
+            gatewayRefundId = refund.GatewayRefundId
+        });
     }
 
     // ── GET /api/registrations/export  ── admin ─────────────────────────────
@@ -477,9 +546,6 @@ public class RegistrationsController : ControllerBase
     }
 
     // ── GET /api/registrations/:id/receipt  ── public ─────────────────────────
-    // Returns a PDF receipt. Always reflects current refund state.
-    // "Public" intentionally — the registration ID acts as the access token.
-    // The browser triggers a file download via Content-Disposition: attachment.
     [HttpGet("{id:int}/receipt")]
     public async Task<IActionResult> GetReceipt(int id)
     {
@@ -511,6 +577,21 @@ public class RegistrationsController : ControllerBase
             .Include(r => r.Payments).ThenInclude(p => p.Items)
             .FirstOrDefaultAsync(r => r.RegistrationId == id);
 
+    // ── Status code translation helpers ──────────────────────────────────────
+    // DB stores short codes; the frontend TypeScript types use long names.
+    // All translation is centralised here so no other file needs to change.
+
+    private static string PayStatusToDb(string s) => s switch
+    {
+        "Success"           => "S",
+        "Pending"           => "P",
+        "PartiallyRefunded" => "PR",
+        "FullyRefunded"     => "FR",
+        "Failed"            => "F",
+        "Cancelled"         => "X",
+        _                   => s    // already a short code — pass through
+    };
+
     // ── Map helpers ──────────────────────────────────────────────────────────
     private static object MapPayment(Payment p) => new
     {
@@ -521,15 +602,7 @@ public class RegistrationsController : ControllerBase
         method = p.PaymentMethod,
         amount = p.Amount,
         currency = p.Currency,
-        paymentStatus = p.PaymentStatus switch {
-            "P"  => "Pending",
-            "S"  => "Success",
-            "PR" => "PartiallyRefunded",
-            "FR" => "FullyRefunded",
-            "F"  => "Failed",
-            "X"  => "Cancelled",
-            _    => p.PaymentStatus
-        },
+        paymentStatus = p.PaymentStatus,
         receiptNo = p.ReceiptNumber,
         gatewaySessionId = p.GatewaySessionId,
         gatewayPaymentId = p.GatewayPaymentId,
@@ -545,12 +618,7 @@ public class RegistrationsController : ControllerBase
             i.Description,
             i.PlayerName,
             i.Amount,
-            itemStatus = i.ItemStatus switch {
-                "P" => "Pending",
-                "S" => "Success",
-                "R" => "Refunded",
-                _   => i.ItemStatus
-            },
+            itemStatus = i.ItemStatus,
         }).ToList()
     };
 
@@ -594,7 +662,11 @@ public class RegistrationsController : ControllerBase
                     p.GuardianContact,
                     p.DocumentUrl,
                     p.Remark,
-                    customFieldValues = p.CustomFieldValues.ToDictionary(cf => cf.CustomFieldId.ToString(), cf => cf.FieldValue ?? ""),
+                    // Return label-keyed dict to match what the frontend sent on create
+                    customFieldValues = p.CustomFieldValues
+                        .ToDictionary(
+                            cf => cf.FieldLabel ?? cf.CustomFieldId.ToString(),
+                            cf => cf.FieldValue ?? ""),
                 }).ToList()
             }).ToList(),
             payment = payment == null ? null : MapPayment(payment)

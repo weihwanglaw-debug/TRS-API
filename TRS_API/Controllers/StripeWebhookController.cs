@@ -64,6 +64,11 @@ namespace TRS_API.Controllers
                         await HandleCheckoutExpired(expiredSession!, eventId);
                         break;
 
+                    case "charge.refunded":
+                        var refundedCharge = stripeEvent.Data.Object as Charge;
+                        await HandleChargeRefunded(refundedCharge!, eventId);
+                        break;
+
                     default:
                         // Log ignored events
                         _db.WebhookLogs.Add(new WebhookLog
@@ -277,7 +282,7 @@ namespace TRS_API.Controllers
                             var pdfBytes = await receiptSvc.GenerateAsync(jobDb, regIdForJob);
                             _logger.LogInformation("Receipt generated ({Bytes} bytes) for registration {RegId}",
                                 pdfBytes.Length, regIdForJob);
-                            // TODO: await emailSvc.SendPaymentConfirmationAsync(regIdForJob, pdfBytes, ct);
+                            await emailSvc.SendPaymentConfirmationAsync(jobDb, regIdForJob, pdfBytes, ct);
                         }
                         catch (Exception ex)
                         {
@@ -353,6 +358,66 @@ namespace TRS_API.Controllers
             {
                 _logger.LogError(ex, "Error handling checkout expired for session {SessionId}", session.Id);
             }
+        }
+
+        private async Task HandleChargeRefunded(Charge charge, string eventId)
+        {
+            var payment = await _db.Payments
+                .Include(p => p.Items)
+                .Include(p => p.Refunds)
+                .FirstOrDefaultAsync(p => p.GatewayPaymentId == charge.PaymentIntentId || p.GatewayChargeId == charge.Id);
+
+            if (payment == null)
+            {
+                _logger.LogWarning("Refund webhook received for unknown charge/payment intent {ChargeId}/{PaymentIntentId}", charge.Id, charge.PaymentIntentId);
+                return;
+            }
+
+            var changed = false;
+            foreach (var stripeRefund in charge.Refunds?.Data ?? Enumerable.Empty<Stripe.Refund>())
+            {
+                var localRefund = await _db.Refunds.FirstOrDefaultAsync(r => r.GatewayRefundId == stripeRefund.Id);
+                if (localRefund == null)
+                    continue;
+
+                var newStatus = stripeRefund.Status switch
+                {
+                    "succeeded" => "S",
+                    "failed" => "F",
+                    _ => localRefund.RefundStatus
+                };
+
+                if (localRefund.RefundStatus != newStatus)
+                {
+                    localRefund.RefundStatus = newStatus;
+                    localRefund.ProcessedAt = DateTime.UtcNow;
+                    changed = true;
+                }
+
+                var item = payment.Items.FirstOrDefault(i => i.PaymentItemId == localRefund.PaymentItemId);
+                if (item != null && newStatus == "S" && item.ItemStatus != "R")
+                {
+                    item.ItemStatus = "R";
+                    item.UpdatedAt = DateTime.UtcNow;
+                    changed = true;
+                }
+            }
+
+            if (!changed)
+                return;
+
+            PaymentController.ApplyRefundOutcome(payment);
+            _db.WebhookLogs.Add(new WebhookLog
+            {
+                PaymentGateway = "stripe",
+                GatewayEventId = eventId,
+                EventType = "charge.refunded",
+                PayloadJson = System.Text.Json.JsonSerializer.Serialize(charge),
+                ProcessingStatus = "S",
+                ReceivedAt = DateTime.UtcNow,
+                ProcessedAt = DateTime.UtcNow
+            });
+            await _db.SaveChangesAsync();
         }
     }
 }

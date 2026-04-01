@@ -14,6 +14,38 @@ public class FixturesController : ControllerBase
     private readonly AuthService _auth;
     public FixturesController(TRSDbContext db, AuthService auth) => (_db, _auth) = (db, auth);
 
+    // GET /api/fixtures/status?programIds=1,2,3
+    // Returns { "1": true, "2": false, ... } — true means a fixture row exists in the DB.
+    // Used by the Fixtures table on mount to show Draw/Results status badges without
+    // loading every full bracket JSON.
+    // NOTE: this route must be declared BEFORE the {eventId}/{programId} route so ASP.NET
+    // Core does not try to bind "status" as an int for eventId.
+    [HttpGet("status")]
+    public async Task<IActionResult> GetStatus([FromQuery] string? programIds)
+    {
+        if (string.IsNullOrWhiteSpace(programIds))
+            return Ok(new Dictionary<string, bool>());
+
+        var ids = programIds
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(s => int.TryParse(s, out var n) ? n : 0)
+            .Where(n => n > 0)
+            .Distinct()
+            .ToList();
+
+        if (!ids.Any())
+            return Ok(new Dictionary<string, bool>());
+
+        var existing = await _db.Fixtures
+            .Where(f => ids.Contains(f.ProgramId))
+            .Select(f => f.ProgramId)
+            .ToListAsync();
+
+        // Return string keys to match the frontend Record<string, boolean> type
+        var result = ids.ToDictionary(id => id.ToString(), id => existing.Contains(id));
+        return Ok(result);
+    }
+
     // GET /api/fixtures/:eventId/:programId
     [HttpGet("{eventId:int}/{programId:int}")]
     public async Task<IActionResult> Get(int eventId, int programId)
@@ -56,23 +88,6 @@ public class FixturesController : ControllerBase
         f.UpdatedAt = DateTime.UtcNow;
         await _db.SaveChangesAsync();
         return Ok(new { eventId, programId, f.FixtureFormat, f.IsLocked, f.Phase });
-    }
-
-    // GET /api/fixtures/status?programIds=1,2,3  — bulk existence check for dashboard/table
-    // Returns a dict of programId -> bool (true = fixture exists)
-    [HttpGet("status")]
-    public async Task<IActionResult> GetStatus([FromQuery] string programIds)
-    {
-        var ids = programIds.Split(',', StringSplitOptions.RemoveEmptyEntries)
-            .Select(s => int.TryParse(s.Trim(), out var n) ? n : -1)
-            .Where(n => n > 0).ToList();
-        if (!ids.Any()) return Ok(new Dictionary<string, bool>());
-        var existing = await _db.Fixtures
-            .Where(f => ids.Contains(f.ProgramId))
-            .Select(f => f.ProgramId)
-            .ToListAsync();
-        var result = ids.ToDictionary(id => id.ToString(), id => existing.Contains(id));
-        return Ok(result);
     }
 
     // DELETE /api/fixtures/:eventId/:programId  — reset fixture

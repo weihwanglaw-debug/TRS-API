@@ -1,6 +1,7 @@
 ﻿using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
+using System.Text.Json;
 using Stripe;
 using Stripe.Checkout;
 using TRS_API.Models;
@@ -125,9 +126,9 @@ namespace TRS_API.Controllers
         private async Task<IActionResult> CreateSessionFirstCheckout(PaymentRequest request)
         {
             // Deserialize payload to compute amount server-side
-            var payload = System.Text.Json.JsonSerializer.Deserialize<CreateRegistrationRequest>(
+            var payload = JsonSerializer.Deserialize<CreateRegistrationRequest>(
                 request.RegistrationPayload!.Value.GetRawText(),
-                new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
 
             if (payload == null)
                 return BadRequest(new { message = "Invalid registration payload" });
@@ -330,9 +331,9 @@ namespace TRS_API.Controllers
                 }
 
                 // ── 3. Deserialize registration payload ────────────────────────
-                var req = System.Text.Json.JsonSerializer.Deserialize<CreateRegistrationRequest>(
+                var req = JsonSerializer.Deserialize<CreateRegistrationRequest>(
                     request.RegistrationPayload.GetRawText(),
-                    new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                    new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
 
                 if (req == null)
                     return BadRequest(new { message = "Invalid registration payload." });
@@ -352,7 +353,16 @@ namespace TRS_API.Controllers
                 session.Metadata.TryGetValue("payment_method", out var paymentMethod);
                 paymentMethod ??= "CreditCard";
 
-                // ── 6. Write to DB in one transaction ──────────────────────────
+                // ── 6. Pre-load custom fields for label → ID resolution ────────────
+                var programIds = req.Groups.Select(g => g.ProgramId).Distinct().ToList();
+                var customFieldsByProgram = await _db.ProgramCustomFields
+                    .Where(cf => programIds.Contains(cf.ProgramId))
+                    .GroupBy(cf => cf.ProgramId)
+                    .ToDictionaryAsync(
+                        g => g.Key,
+                        g => g.ToDictionary(cf => cf.Label, cf => cf.CustomFieldId));
+
+                // ── 7. Write to DB in one transaction ──────────────────────────────
                 using var tx = await _db.Database.BeginTransactionAsync();
                 try
                 {
@@ -380,6 +390,46 @@ namespace TRS_API.Controllers
                     // Groups + Participants
                     foreach (var gDto in req.Groups)
                     {
+                        var program = await _db.Programs
+                            .FromSqlRaw(
+                                "SELECT * FROM Programs WITH (UPDLOCK, ROWLOCK) WHERE ProgramID = {0}",
+                                gDto.ProgramId)
+                            .FirstOrDefaultAsync();
+
+                        if (program == null)
+                        {
+                            await tx.RollbackAsync();
+                            return NotFound(new { message = $"Program '{gDto.ProgramName}' not found." });
+                        }
+
+                        if (!program.IsActive || program.Status == "closed")
+                        {
+                            await tx.RollbackAsync();
+                            return BadRequest(new { message = $"'{gDto.ProgramName}' is no longer accepting registrations." });
+                        }
+
+                        var activeGroupCount = await _db.ParticipantGroups
+                            .CountAsync(g => g.ProgramId == gDto.ProgramId
+                                && g.GroupStatus != "Cancelled"
+                                && g.GroupStatus != "Waitlisted");
+
+                        if (activeGroupCount >= program.MaxParticipants)
+                        {
+                            await tx.RollbackAsync();
+                            return BadRequest(new { message = $"'{gDto.ProgramName}' is full. No slots remaining." });
+                        }
+
+                        var isDuplicate = await _db.ParticipantGroups
+                            .AnyAsync(g => g.ProgramId == gDto.ProgramId
+                                && g.GroupStatus != "Cancelled"
+                                && g.Registration.ContactEmail == req.ContactEmail);
+
+                        if (isDuplicate)
+                        {
+                            await tx.RollbackAsync();
+                            return BadRequest(new { message = $"'{req.ContactEmail}' is already registered for '{gDto.ProgramName}'." });
+                        }
+
                         var group = new ParticipantGroup
                         {
                             RegistrationId = reg.RegistrationId,
@@ -419,16 +469,31 @@ namespace TRS_API.Controllers
                         await _db.SaveChangesAsync();
 
                         // Custom field values
+                        // Frontend sends { "Field Label": "value" } — resolve label → CustomFieldId
+                        // via pre-loaded lookup. Drop unknown labels with a warning rather than
+                        // saving rows that would violate the FK on CustomFieldId.
+                        var cfLookup = customFieldsByProgram.GetValueOrDefault(gDto.ProgramId)
+                                       ?? new Dictionary<string, int>();
                         for (int pi = 0; pi < gDto.Participants.Count; pi++)
-                            foreach (var (key, val) in gDto.Participants[pi].CustomFieldValues)
-                                if (int.TryParse(key, out var cfId))
-                                    _db.ParticipantCustomFieldValues.Add(new ParticipantCustomFieldValue
-                                    {
-                                        ParticipantId = parts[pi].ParticipantId,
-                                        CustomFieldId = cfId,
-                                        FieldLabel    = key,
-                                        FieldValue    = val,
-                                    });
+                        {
+                            foreach (var (label, val) in gDto.Participants[pi].CustomFieldValues)
+                            {
+                                if (!cfLookup.TryGetValue(label, out var cfId))
+                                {
+                                    _logger.LogWarning(
+                                        "Custom field label '{Label}' not found for program {ProgramId} — skipping",
+                                        label, gDto.ProgramId);
+                                    continue;
+                                }
+                                _db.ParticipantCustomFieldValues.Add(new ParticipantCustomFieldValue
+                                {
+                                    ParticipantId = parts[pi].ParticipantId,
+                                    CustomFieldId = cfId,
+                                    FieldLabel    = label,
+                                    FieldValue    = val,
+                                });
+                            }
+                        }
 
                         group.ClubDisplay  = parts.FirstOrDefault()?.ClubSchoolCompany ?? "";
                         group.NamesDisplay = string.Join(" / ", parts.Select(p => p.FullName));
@@ -503,7 +568,7 @@ namespace TRS_API.Controllers
                         try
                         {
                             var pdfBytes = await receiptSvc.GenerateAsync(jobDb, regIdForJob);
-                            // TODO: await emailSvc.SendPaymentConfirmationAsync(regIdForJob, pdfBytes, ct);
+                            await emailSvc.SendPaymentConfirmationAsync(jobDb, regIdForJob, pdfBytes, ct);
                             _logger.LogInformation("Receipt generated for registration {RegId}", regIdForJob);
                         }
                         catch (Exception ex)
@@ -562,6 +627,20 @@ namespace TRS_API.Controllers
                 _logger.LogError(ex, "Error verifying payment {PaymentId}", paymentId);
                 return StatusCode(500, new { message = "Failed to verify payment" });
             }
+        }
+
+        internal static void ApplyRefundOutcome(Payment payment)
+        {
+            var totalItems = payment.Items.Count;
+            var refundedItems = payment.Items.Count(i => i.ItemStatus == "R");
+
+            payment.PaymentStatus = refundedItems switch
+            {
+                0 => "S",
+                var count when count >= totalItems && totalItems > 0 => "FR",
+                _ => "PR",
+            };
+            payment.UpdatedAt = DateTime.UtcNow;
         }
     }
 }
