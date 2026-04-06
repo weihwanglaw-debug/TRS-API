@@ -1,6 +1,7 @@
 using TRS_API.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
 using Stripe;
 using TRS_API.Models;
@@ -64,6 +65,7 @@ public class RegistrationsController : ControllerBase
     }
 
     // ── POST /api/registrations  ── public ─────────────────────────────────
+    [EnableRateLimiting("payment")]
     [HttpPost]
     public async Task<IActionResult> Create([FromBody] CreateRegistrationRequest req)
     {
