@@ -7,7 +7,7 @@ public partial class EventRegistration
     public int EventId { get; set; }
     public string EventName { get; set; } = null!;     // snapshotted
     public DateTime SubmittedAt { get; set; }
-    public string RegStatus { get; set; } = "Pending"; // Pending|Confirmed|Cancelled|Waitlisted
+    public string RegStatus { get; set; } = "Pending"; // Pending|Confirmed|Cancelled
     public string ContactName { get; set; } = null!;
     public string ContactEmail { get; set; } = null!;
     public string? ContactPhone { get; set; }

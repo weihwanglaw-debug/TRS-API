@@ -3,6 +3,7 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using Stripe;
 using Stripe.Checkout;
+using TRS_API.Models;
 using TRS_API.Services;
 using TRS_Data;
 using TRS_Data.Models;
@@ -131,26 +132,92 @@ namespace TRS_API.Controllers
 
         private async Task HandleCheckoutCompleted(Session session, string eventId)
         {
-            // ── Session-first flow: DB write is handled by confirm-session endpoint ──
-            // The frontend calls POST /api/Payment/confirm-session after Stripe redirects
-            // back. Nothing for the webhook to do for these sessions.
+            // ── Session-first flow: recover via PendingCheckouts ledger ───────
+            // Primary path: confirm-session() already wrote the registration and
+            // purged the PendingCheckout row. The idempotency check below catches
+            // that case and exits cleanly.
+            //
+            // Recovery path: user never returned to /payment/result (closed browser,
+            // network drop, etc.). The PendingCheckout row still exists. We read the
+            // stored payload JSON and perform the same DB write as confirm-session().
             if (session.Metadata.TryGetValue("flow", out var flow) && flow == "session_first")
             {
+                // Idempotency: if confirm-session() already ran, a Payment row exists.
+                var alreadyConfirmed = await _db.Payments
+                    .AnyAsync(p => p.GatewaySessionId == session.Id && p.PaymentStatus == "S");
+
+                if (alreadyConfirmed)
+                {
+                    _logger.LogInformation(
+                        "Webhook: session-first session {SessionId} already confirmed by confirm-session — no action",
+                        session.Id);
+                    _db.WebhookLogs.Add(new WebhookLog
+                    {
+                        PaymentGateway   = "stripe",
+                        GatewayEventId   = eventId,
+                        EventType        = "checkout.session.completed",
+                        PayloadJson      = System.Text.Json.JsonSerializer.Serialize(session),
+                        ProcessingStatus = "I",
+                        ReceivedAt       = DateTime.UtcNow,
+                        ProcessedAt      = DateTime.UtcNow
+                    });
+                    await _db.SaveChangesAsync();
+                    return;
+                }
+
+                // Look up the pending checkout ledger row.
+                var pending = await _db.PendingCheckouts
+                    .FirstOrDefaultAsync(p => p.GatewaySessionId == session.Id);
+
+                if (pending == null)
+                {
+                    _logger.LogWarning(
+                        "Webhook: no PendingCheckout row found for session-first session {SessionId} — may already be processed",
+                        session.Id);
+                    _db.WebhookLogs.Add(new WebhookLog
+                    {
+                        PaymentGateway   = "stripe",
+                        GatewayEventId   = eventId,
+                        EventType        = "checkout.session.completed",
+                        PayloadJson      = System.Text.Json.JsonSerializer.Serialize(session),
+                        ProcessingStatus = "I",
+                        ReceivedAt       = DateTime.UtcNow,
+                        ProcessedAt      = DateTime.UtcNow
+                    });
+                    await _db.SaveChangesAsync();
+                    return;
+                }
+
+                // Deserialize the stored payload and perform the DB write.
                 _logger.LogInformation(
-                    "Webhook: session-first session {SessionId} completed — DB write handled by confirm-session",
+                    "Webhook: recovering session-first session {SessionId} from PendingCheckouts ledger",
                     session.Id);
 
-                _db.WebhookLogs.Add(new WebhookLog
+                try
                 {
-                    PaymentGateway = "stripe",
-                    GatewayEventId = eventId,
-                    EventType      = "checkout.session.completed",
-                    PayloadJson    = System.Text.Json.JsonSerializer.Serialize(session),
-                    ProcessingStatus = "I",   // I = informational, no action taken
-                    ReceivedAt     = DateTime.UtcNow,
-                    ProcessedAt    = DateTime.UtcNow
-                });
-                await _db.SaveChangesAsync();
+                    await WriteSessionFirstRegistration(session, pending.PayloadJson, eventId);
+                    // Purge the ledger row — registration is now in DB.
+                    _db.PendingCheckouts.Remove(pending);
+                    await _db.SaveChangesAsync();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex,
+                        "Webhook: failed to recover session-first session {SessionId}", session.Id);
+                    _db.WebhookLogs.Add(new WebhookLog
+                    {
+                        PaymentGateway   = "stripe",
+                        GatewayEventId   = eventId,
+                        EventType        = "checkout.session.completed",
+                        PayloadJson      = System.Text.Json.JsonSerializer.Serialize(session),
+                        ProcessingStatus = "F",
+                        ErrorMessage     = ex.Message,
+                        ReceivedAt       = DateTime.UtcNow,
+                        ProcessedAt      = DateTime.UtcNow
+                    });
+                    await _db.SaveChangesAsync();
+                    throw;
+                }
                 return;
             }
 
@@ -327,14 +394,33 @@ namespace TRS_API.Controllers
 
         private async Task HandleCheckoutExpired(Session session, string eventId)
         {
-            // Session-first flow: no DB record was created, nothing to expire
+            // Session-first flow: no registration in DB — just purge the ledger row.
+            // The user never paid, so there is nothing to cancel in the DB.
             if (session.Metadata.TryGetValue("flow", out var flow) && flow == "session_first")
             {
-                _logger.LogInformation("Webhook: session-first session {SessionId} expired — no DB action needed", session.Id);
+                _logger.LogInformation(
+                    "Webhook: session-first session {SessionId} expired — purging PendingCheckout row",
+                    session.Id);
+                try
+                {
+                    var pending = await _db.PendingCheckouts
+                        .FindAsync(session.Id);
+                    if (pending != null)
+                    {
+                        _db.PendingCheckouts.Remove(pending);
+                        await _db.SaveChangesAsync();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // Non-fatal — PaymentCleanupWorker will prune it on next run.
+                    _logger.LogWarning(ex,
+                        "Failed to purge PendingCheckout for expired session {SessionId}", session.Id);
+                }
                 return;
             }
 
-            // Legacy flow: cancel the pending payment if it exists
+            // Legacy flow: cancel the pending payment if it exists.
             try
             {
                 var payment = await _db.Payments.FirstOrDefaultAsync(p => p.GatewaySessionId == session.Id);
@@ -418,6 +504,236 @@ namespace TRS_API.Controllers
                 ProcessedAt = DateTime.UtcNow
             });
             await _db.SaveChangesAsync();
+        }
+
+        /// <summary>
+        /// Performs the same DB write as PaymentController.ConfirmSession() but driven
+        /// by the Stripe webhook. Called when the user never returned to /payment/result
+        /// after a successful payment — the PendingCheckout ledger row provides the payload.
+        /// </summary>
+        private async Task WriteSessionFirstRegistration(Session session, string payloadJson, string eventId)
+        {
+            var jsonOptions = new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+            var req = System.Text.Json.JsonSerializer.Deserialize<CreateRegistrationRequest>(payloadJson, jsonOptions);
+            if (req == null) throw new InvalidOperationException("Failed to deserialize PendingCheckout payload.");
+
+            var stripeAmount = (session.AmountTotal ?? 0) / 100m;
+            session.Metadata.TryGetValue("payment_method", out var paymentMethod);
+            paymentMethod ??= "CreditCard";
+
+            // Pre-load custom fields for label → ID resolution
+            var programIds = req.Groups.Select(g => g.ProgramId).Distinct().ToList();
+            var customFieldsByProgram = await _db.ProgramCustomFields
+                .Where(cf => programIds.Contains(cf.ProgramId))
+                .GroupBy(cf => cf.ProgramId)
+                .ToDictionaryAsync(
+                    g => g.Key,
+                    g => g.ToDictionary(cf => cf.Label, cf => cf.CustomFieldId));
+
+            using var tx = await _db.Database.BeginTransactionAsync();
+
+            var reg = new EventRegistration
+            {
+                EventId            = req.EventId,
+                EventName          = req.EventName,
+                RegStatus          = "Confirmed",
+                RegistrationStatus = "C",
+                ContactName        = req.ContactName,
+                ContactEmail       = req.ContactEmail,
+                ContactPhone       = req.ContactPhone,
+                TotalAmount        = stripeAmount,
+                Currency           = req.Payment?.Currency ?? "SGD",
+                SubmittedAt        = DateTime.UtcNow,
+                CreatedAt          = DateTime.UtcNow,
+                ConfirmedAt        = DateTime.UtcNow,
+            };
+            _db.EventRegistrations.Add(reg);
+            await _db.SaveChangesAsync();
+
+            var allItems = new List<PaymentItem>();
+
+            foreach (var gDto in req.Groups)
+            {
+                // Capacity check (race-condition safe)
+                var program = await _db.Programs
+                    .FromSqlRaw("SELECT * FROM Programs WITH (UPDLOCK, ROWLOCK) WHERE ProgramID = {0}", gDto.ProgramId)
+                    .FirstOrDefaultAsync();
+                if (program == null)
+                    throw new InvalidOperationException($"Program '{gDto.ProgramName}' not found.");
+                if (!program.IsActive || program.Status == "closed")
+                    throw new InvalidOperationException($"Program '{gDto.ProgramName}' is closed.");
+
+                var activeGroupCount = await _db.ParticipantGroups
+                    .CountAsync(g => g.ProgramId == gDto.ProgramId
+                        && g.GroupStatus != "Cancelled");
+                if (activeGroupCount >= program.MaxParticipants)
+                    throw new InvalidOperationException($"Program '{gDto.ProgramName}' is full.");
+
+                // Duplicate check (participant identity)
+                var incomingParticipants = gDto.Participants
+                    .Select(p => new
+                    {
+                        p.FullName,
+                        Dob = string.IsNullOrWhiteSpace(p.Dob) ? (DateOnly?)null : DateOnly.Parse(p.Dob),
+                    }).ToList();
+
+                var isDuplicate = await _db.ParticipantGroups
+                    .AnyAsync(g => g.ProgramId == gDto.ProgramId
+                        && g.GroupStatus != "Cancelled"
+                        && g.Participants.Any(existing => incomingParticipants.Any(incoming =>
+                            incoming.FullName == existing.FullName
+                            && incoming.Dob == existing.DateOfBirth)));
+                if (isDuplicate)
+                    throw new InvalidOperationException($"Duplicate participant detected for '{gDto.ProgramName}'.");
+
+                var group = new ParticipantGroup
+                {
+                    RegistrationId = reg.RegistrationId,
+                    EventId        = req.EventId,
+                    ProgramId      = gDto.ProgramId,
+                    ProgramName    = gDto.ProgramName,
+                    Fee            = gDto.Fee,
+                    GroupStatus    = "Confirmed",
+                    CreatedAt      = DateTime.UtcNow,
+                };
+                _db.ParticipantGroups.Add(group);
+                await _db.SaveChangesAsync();
+
+                var parts = new List<Participant>();
+                foreach (var pDto in gDto.Participants)
+                {
+                    var p = new Participant
+                    {
+                        GroupId           = group.GroupId,
+                        FullName          = pDto.FullName,
+                        DateOfBirth       = pDto.Dob != null ? DateOnly.Parse(pDto.Dob) : null,
+                        Gender            = pDto.Gender,
+                        Nationality       = pDto.Nationality,
+                        ClubSchoolCompany = pDto.ClubSchoolCompany,
+                        Email             = pDto.Email,
+                        ContactNumber     = pDto.ContactNumber,
+                        TshirtSize        = pDto.TshirtSize,
+                        SbaId             = pDto.SbaId,
+                        GuardianName      = pDto.GuardianName,
+                        GuardianContact   = pDto.GuardianContact,
+                        Remark            = pDto.Remark,
+                        CreatedAt         = DateTime.UtcNow,
+                    };
+                    _db.Participants.Add(p);
+                    parts.Add(p);
+                }
+                await _db.SaveChangesAsync();
+
+                // Custom field values
+                var cfLookup = customFieldsByProgram.GetValueOrDefault(gDto.ProgramId)
+                               ?? new Dictionary<string, int>();
+                for (int pi = 0; pi < gDto.Participants.Count; pi++)
+                {
+                    foreach (var (label, val) in gDto.Participants[pi].CustomFieldValues)
+                    {
+                        if (!cfLookup.TryGetValue(label, out var cfId))
+                        {
+                            _logger.LogWarning(
+                                "Webhook: custom field '{Label}' not found for program {ProgramId} — skipping",
+                                label, gDto.ProgramId);
+                            continue;
+                        }
+                        _db.ParticipantCustomFieldValues.Add(new ParticipantCustomFieldValue
+                        {
+                            ParticipantId = parts[pi].ParticipantId,
+                            CustomFieldId = cfId,
+                            FieldLabel    = label,
+                            FieldValue    = val,
+                        });
+                    }
+                }
+
+                group.ClubDisplay  = parts.FirstOrDefault()?.ClubSchoolCompany ?? "";
+                group.NamesDisplay = string.Join(" / ", parts.Select(p => p.FullName));
+
+                foreach (var iDto in gDto.Items)
+                {
+                    int? participantId = null;
+                    if (iDto.ParticipantIndex.HasValue && iDto.ParticipantIndex < parts.Count)
+                        participantId = parts[iDto.ParticipantIndex.Value].ParticipantId;
+
+                    allItems.Add(new PaymentItem
+                    {
+                        GroupId       = group.GroupId,
+                        EventId       = req.EventId,
+                        ProgramId     = gDto.ProgramId,
+                        ProgramName   = iDto.ProgramName,
+                        Description   = iDto.Description,
+                        PlayerName    = iDto.PlayerName,
+                        Amount        = iDto.Amount,
+                        ItemStatus    = "S",
+                        CreatedAt     = DateTime.UtcNow,
+                        ParticipantId = participantId,
+                    });
+                }
+            }
+
+            var receiptNo = $"TRS-{DateTime.UtcNow:yyyyMMdd}-{Random.Shared.Next(10000, 99999):D5}";
+            var payment = new Payment
+            {
+                RegistrationId   = reg.RegistrationId,
+                EventId          = req.EventId,
+                PaymentGateway   = "Stripe",
+                PaymentMethod    = paymentMethod,
+                Amount           = stripeAmount,
+                Currency         = req.Payment?.Currency ?? "SGD",
+                PaymentStatus    = "S",
+                GatewaySessionId = session.Id,
+                GatewayPaymentId = session.PaymentIntentId,
+                ReceiptNumber    = receiptNo,
+                CreatedAt        = DateTime.UtcNow,
+                PaidAt           = DateTime.UtcNow,
+            };
+            _db.Payments.Add(payment);
+            await _db.SaveChangesAsync();
+
+            foreach (var item in allItems) { item.PaymentId = payment.PaymentId; _db.PaymentItems.Add(item); }
+            await _db.SaveChangesAsync();
+
+            _db.WebhookLogs.Add(new WebhookLog
+            {
+                PaymentGateway   = "stripe",
+                GatewayEventId   = eventId,
+                EventType        = "checkout.session.completed",
+                PayloadJson      = System.Text.Json.JsonSerializer.Serialize(session),
+                ProcessingStatus = "S",
+                ReceivedAt       = DateTime.UtcNow,
+                ProcessedAt      = DateTime.UtcNow
+            });
+            await _db.SaveChangesAsync();
+            await tx.CommitAsync();
+
+            _logger.LogInformation(
+                "Webhook: recovered session-first registration {RegId} receipt {Receipt} for session {SessionId}",
+                reg.RegistrationId, receiptNo, session.Id);
+
+            // Queue receipt PDF + confirmation email
+            var regIdForJob = reg.RegistrationId;
+            var payIdForJob = payment.PaymentId;
+            await _jobQueue.EnqueueAsync(async ct =>
+            {
+                using var scope = _serviceScopeFactory.CreateScope();
+                var receiptSvc  = scope.ServiceProvider.GetRequiredService<ReceiptService>();
+                var emailSvc    = scope.ServiceProvider.GetRequiredService<EmailService>();
+                var jobDb       = scope.ServiceProvider.GetRequiredService<TRSDbContext>();
+                try
+                {
+                    var pdfBytes = await receiptSvc.GenerateAsync(jobDb, regIdForJob);
+                    await emailSvc.SendPaymentConfirmationAsync(jobDb, regIdForJob, pdfBytes, ct);
+                    _logger.LogInformation(
+                        "Webhook: receipt generated for recovered registration {RegId}", regIdForJob);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex,
+                        "Webhook: failed to generate receipt for payment {PaymentId}", payIdForJob);
+                }
+            });
         }
     }
 }

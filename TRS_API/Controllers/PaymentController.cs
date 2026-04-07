@@ -1,4 +1,4 @@
-using Microsoft.AspNetCore.Mvc;
+﻿using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
 using System.Text.Json;
@@ -12,7 +12,7 @@ namespace TRS_API.Controllers
 {
     [ApiController]
     [Route("api/[controller]")]
-    // NO [Authorize] � public access for event registration payments
+    // NO [Authorize] - public access for event registration payments
     public class PaymentController : ControllerBase
     {
         private readonly ILogger<PaymentController> _logger;
@@ -74,13 +74,13 @@ namespace TRS_API.Controllers
         // -- POST /api/Payment/create-checkout-session -------------------------
         // Handles two paths:
         //
-        // PATH A � Session-first (paid registrations, new flow):
+        // PATH A - Session-first (paid registrations, new flow):
         //   Frontend sends: { registrationPayload: {...}, paymentMethod, successUrl, cancelUrl }
         //   Backend: computes amount from payload, creates Stripe session, returns checkoutUrl.
         //   NO database write. DB insert happens in /api/registrations/confirm-session
         //   after the user returns from Stripe with a successful payment.
         //
-        // PATH B � Legacy (free registrations, unchanged):
+        // PATH B - Legacy (free registrations, unchanged):
         //   Frontend sends: { registrationId, paymentMethod, successUrl, cancelUrl }
         //   Backend: reads amount from DB, creates Stripe session, returns checkoutUrl.
         [EnableRateLimiting("payment")]
@@ -133,7 +133,7 @@ namespace TRS_API.Controllers
             if (payload == null)
                 return BadRequest(new { message = "Invalid registration payload" });
 
-            // Compute total from groups � never trust client-sent amount
+            // Compute total from groups - never trust client-sent amount
             var totalAmount = payload.Groups.Sum(g => g.Fee);
             if (totalAmount <= 0)
                 return BadRequest(new { message = "Total amount must be greater than zero" });
@@ -195,6 +195,62 @@ namespace TRS_API.Controllers
                 "Created session-first {Method} Stripe session {SessionId} for event {EventId} contact {Email}",
                 dbMethod, session.Id, payload.EventId, payload.ContactEmail);
 
+            // ── Persist payload to PendingCheckouts ledger ────────────────────
+            // This is the safety net: if the user never returns to /payment/result,
+            // the Stripe webhook reads this row to reconstruct and save the registration.
+            //
+            // UPSERT — not insert-if-missing:
+            //   When the PayNow idempotency key rotates (every 30 min), Stripe creates
+            //   a new session and we always INSERT. For card sessions, the stable
+            //   idempotency key can cause Stripe to return an EXISTING session ID when
+            //   the user retries with a different cart but the same event + email + total.
+            //   In that case we must UPDATE the stored payload to the latest cart so the
+            //   webhook never replays a stale one.
+            //
+            // FATAL on failure:
+            //   If we cannot write this row we cannot guarantee recovery if the user
+            //   never returns from Stripe. Rather than silently hand the user a URL with
+            //   no safety net, we fail the request. The user retries and the next attempt
+            //   will succeed. A DB write failure here indicates a wider infrastructure
+            //   problem that should be surfaced immediately.
+            var newExpiresAt   = session.ExpiresAt;
+            var newPayloadJson = request.RegistrationPayload!.Value.GetRawText();
+
+            var existing = await _db.PendingCheckouts
+                .FindAsync(session.Id);
+
+            if (existing == null)
+            {
+                _db.PendingCheckouts.Add(new TRS_Data.Models.PendingCheckout
+                {
+                    GatewaySessionId = session.Id,
+                    EventId          = payload.EventId,
+                    ContactEmail     = payload.ContactEmail ?? "",
+                    PayloadJson      = newPayloadJson,
+                    PaymentMethod    = dbMethod,
+                    CreatedAt        = DateTime.UtcNow,
+                    ExpiresAt        = newExpiresAt,
+                });
+            }
+            else
+            {
+                // Session ID reused by Stripe (stable idempotency key, same amount).
+                // Always overwrite with the latest payload so webhook recovery is current.
+                existing.PayloadJson   = newPayloadJson;
+                existing.ContactEmail  = payload.ContactEmail ?? "";
+                existing.PaymentMethod = dbMethod;
+                existing.ExpiresAt     = newExpiresAt;
+            }
+
+            // Fatal: if we cannot guarantee webhook recovery, do not give the user a
+            // checkout URL. Let the exception bubble to the outer try/catch which
+            // returns 500 — the user retries and the next attempt will succeed.
+            await _db.SaveChangesAsync();
+
+            _logger.LogInformation(
+                "PendingCheckout {Action} for session {SessionId} event {EventId}",
+                existing == null ? "created" : "updated", session.Id, payload.EventId);
+
             return Ok(new
             {
                 checkoutUrl      = session.Url,
@@ -248,7 +304,7 @@ namespace TRS_API.Controllers
                             ProductData = new SessionLineItemPriceDataProductDataOptions
                             {
                                 Name        = "Tournament Registration",
-                                Description = $"Registration #{registration.RegistrationId} � {registration.EventName}"
+                                Description = $"Registration #{registration.RegistrationId} - {registration.EventName}"
                             }
                         },
                         Quantity = 1
@@ -316,7 +372,7 @@ namespace TRS_API.Controllers
 
                 if (session.PaymentStatus != "paid")
                 {
-                    _logger.LogWarning("Session {SessionId} not paid � status: {Status}",
+                    _logger.LogWarning("Session {SessionId} not paid - status: {Status}",
                         request.GatewaySessionId, session.PaymentStatus);
                     return BadRequest(new { message = "Payment has not been confirmed by Stripe." });
                 }
@@ -328,7 +384,7 @@ namespace TRS_API.Controllers
                                            && p.PaymentStatus == "S");
                 if (existing != null)
                 {
-                    _logger.LogInformation("Session {SessionId} already confirmed ? reg {RegId}",
+                    _logger.LogInformation("Session {SessionId} already confirmed -> reg {RegId}",
                         request.GatewaySessionId, existing.RegistrationId);
                     return Ok(new { registrationId = existing.RegistrationId.ToString() });
                 }
@@ -349,14 +405,14 @@ namespace TRS_API.Controllers
                     _logger.LogWarning(
                         "Amount mismatch for session {SessionId}: payload={Payload} stripe={Stripe}",
                         request.GatewaySessionId, computedAmount, stripeAmount);
-                    // Log but don't block � Stripe amount is ground truth
+                    // Log but don't block - Stripe amount is ground truth
                 }
 
                 // -- 5. Read payment method from Stripe metadata ----------------
                 session.Metadata.TryGetValue("payment_method", out var paymentMethod);
                 paymentMethod ??= "CreditCard";
 
-                // -- 6. Pre-load custom fields for label ? ID resolution ------------
+                // -- 6. Pre-load custom fields for label -> ID resolution ------------
                 var programIds = req.Groups.Select(g => g.ProgramId).Distinct().ToList();
                 var customFieldsByProgram = await _db.ProgramCustomFields
                     .Where(cf => programIds.Contains(cf.ProgramId))
@@ -413,8 +469,7 @@ namespace TRS_API.Controllers
 
                         var activeGroupCount = await _db.ParticipantGroups
                             .CountAsync(g => g.ProgramId == gDto.ProgramId
-                                && g.GroupStatus != "Cancelled"
-                                && g.GroupStatus != "Waitlisted");
+                                && g.GroupStatus != "Cancelled");
 
                         if (activeGroupCount >= program.MaxParticipants)
                         {
@@ -433,7 +488,6 @@ namespace TRS_API.Controllers
                         var isDuplicate = await _db.ParticipantGroups
                             .AnyAsync(g => g.ProgramId == gDto.ProgramId
                                 && g.GroupStatus != "Cancelled"
-                                && g.GroupStatus != "Waitlisted"
                                 && g.Participants.Any(existing => incomingParticipants.Any(incoming =>
                                     incoming.FullName == existing.FullName
                                     && incoming.Dob == existing.DateOfBirth)));
@@ -483,7 +537,7 @@ namespace TRS_API.Controllers
                         await _db.SaveChangesAsync();
 
                         // Custom field values
-                        // Frontend sends { "Field Label": "value" } � resolve label ? CustomFieldId
+                        // Frontend sends { "Field Label": "value" } - resolve label -> CustomFieldId
                         // via pre-loaded lookup. Drop unknown labels with a warning rather than
                         // saving rows that would violate the FK on CustomFieldId.
                         var cfLookup = customFieldsByProgram.GetValueOrDefault(gDto.ProgramId)
@@ -495,7 +549,7 @@ namespace TRS_API.Controllers
                                 if (!cfLookup.TryGetValue(label, out var cfId))
                                 {
                                     _logger.LogWarning(
-                                        "Custom field label '{Label}' not found for program {ProgramId} � skipping",
+                                        "Custom field label '{Label}' not found for program {ProgramId} - skipping",
                                         label, gDto.ProgramId);
                                     continue;
                                 }
@@ -538,7 +592,7 @@ namespace TRS_API.Controllers
                     // Receipt number
                     var receiptNo = $"TRS-{DateTime.UtcNow:yyyyMMdd}-{Random.Shared.Next(10000, 99999):D5}";
 
-                    // Payment record � written as Success immediately
+                    // Payment record - written as Success immediately
                     var payment = new Payment
                     {
                         RegistrationId   = reg.RegistrationId,
@@ -569,6 +623,25 @@ namespace TRS_API.Controllers
                     _logger.LogInformation(
                         "confirm-session: created registration {RegId} receipt {Receipt} for session {SessionId}",
                         reg.RegistrationId, receiptNo, request.GatewaySessionId);
+
+                    // ── Purge PendingCheckout row — registration is now safely in DB ──
+                    try
+                    {
+                        var pending = await _db.PendingCheckouts
+                            .FindAsync(request.GatewaySessionId);
+                        if (pending != null)
+                        {
+                            _db.PendingCheckouts.Remove(pending);
+                            await _db.SaveChangesAsync();
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        // Non-fatal: row will be cleaned up by PaymentCleanupWorker.
+                        _logger.LogWarning(ex,
+                            "Failed to purge PendingCheckout for session {SessionId}",
+                            request.GatewaySessionId);
+                    }
 
                     // Queue background job: generate receipt PDF + send email
                     var regIdForJob = reg.RegistrationId;

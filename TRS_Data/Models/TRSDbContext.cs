@@ -28,6 +28,7 @@ public partial class TRSDbContext : DbContext
     public virtual DbSet<BackgroundJob>              BackgroundJobs             { get; set; }
     public virtual DbSet<PaymentAuditLog>            PaymentAuditLogs           { get; set; }
     public virtual DbSet<AdminAuditLog>              AdminAuditLogs             { get; set; }
+    public virtual DbSet<PendingCheckout>            PendingCheckouts           { get; set; }
 
     protected override void OnConfiguring(DbContextOptionsBuilder optionsBuilder)
     {
@@ -386,6 +387,18 @@ public partial class TRSDbContext : DbContext
             e.Property(x => x.CreatedAt).HasDefaultValueSql("(sysutcdatetime())");
             e.HasOne(x => x.User).WithMany()
              .HasForeignKey(x => x.UserId).IsRequired(false).HasConstraintName("FK_AdminAuditLog_User");
+        });
+
+        // PendingCheckouts
+        mb.Entity<PendingCheckout>(e => {
+            e.ToTable("PendingCheckouts");
+            e.HasKey(x => x.GatewaySessionId).HasName("PK_PendingCheckouts");
+            e.Property(x => x.GatewaySessionId).HasMaxLength(255).IsUnicode(false)
+             .HasColumnName("GatewaySessionID");
+            e.Property(x => x.ContactEmail).HasMaxLength(255);
+            e.Property(x => x.PaymentMethod).HasMaxLength(20).IsUnicode(false).HasDefaultValue("CreditCard");
+            e.Property(x => x.PayloadJson).HasColumnType("nvarchar(max)").HasColumnName("PayloadJSON");
+            e.Property(x => x.CreatedAt).HasDefaultValueSql("(sysutcdatetime())");
         });
 
         OnModelCreatingPartial(mb);

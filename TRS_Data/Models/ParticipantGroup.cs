@@ -7,7 +7,7 @@ public partial class ParticipantGroup
     public int ProgramId { get; set; }
     public string ProgramName { get; set; } = null!;   // snapshotted at checkout
     public decimal Fee { get; set; }
-    public string GroupStatus { get; set; } = "Pending";  // Pending|Confirmed|Cancelled|Waitlisted
+    public string GroupStatus { get; set; } = "Pending";  // Pending|Confirmed|Cancelled
     public int? Seed { get; set; }
     public string? ClubDisplay { get; set; }
     public string? NamesDisplay { get; set; }

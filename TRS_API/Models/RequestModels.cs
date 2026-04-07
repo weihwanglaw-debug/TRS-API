@@ -173,3 +173,101 @@ public class SaveFixtureRequest
     public string? Phase { get; set; }
     public bool IsLocked { get; set; }
 }
+
+public class GenerateFixtureRequest
+{
+    [Required] public FixtureConfigRequest Config { get; set; } = new();
+    [Required] public List<FixtureSeedEntryRequest> Seeds { get; set; } = new();
+    public string? PreviewBracketJson { get; set; }
+}
+
+public class FixtureConfigRequest
+{
+    [Required] public string Format { get; set; } = null!;
+    public int NumSeeds { get; set; }
+    public int? NumGroups { get; set; }
+    public int? AdvancePerGroup { get; set; }
+    public string? CrossGroupPairing { get; set; }
+    public StandingPointsRequest? StandingPoints { get; set; }
+    public HeatsConfigRequest? HeatsConfig { get; set; }
+}
+
+public class StandingPointsRequest
+{
+    public int Win { get; set; }
+    public int Draw { get; set; }
+    public int Loss { get; set; }
+}
+
+public class HeatsConfigRequest
+{
+    public int NumRounds { get; set; }
+    public int AdvancePerRound { get; set; }
+    public string ResultLabel { get; set; } = "Result";
+    public int PlacesAwarded { get; set; }
+}
+
+public class FixtureSeedEntryRequest
+{
+    [Required] public string Id { get; set; } = null!;
+    public string Club { get; set; } = "";
+    public List<string> Participants { get; set; } = new();
+    public int? Seed { get; set; }
+    public string? SbaId { get; set; }
+    public string? RegistrationId { get; set; }
+    public string? GroupId { get; set; }
+}
+
+public class SwapFixtureTeamsRequest
+{
+    [Required] public string IdA { get; set; } = null!;
+    [Required] public string IdB { get; set; } = null!;
+}
+
+public class SaveFixtureScoreRequest
+{
+    public List<FixtureGameScoreRequest> Games { get; set; } = new();
+    public string? Winner { get; set; }
+    public bool Walkover { get; set; }
+    public string WalkoverWinner { get; set; } = "";
+    public List<FixtureOfficialRequest> Officials { get; set; } = new();
+}
+
+public class FixtureGameScoreRequest
+{
+    public string P1 { get; set; } = "";
+    public string P2 { get; set; } = "";
+}
+
+public class FixtureOfficialRequest
+{
+    public string Id { get; set; } = "";
+    public string Role { get; set; } = "";
+    public string Name { get; set; } = "";
+}
+
+public class UpdateFixtureScheduleRequest
+{
+    public string CourtNo { get; set; } = "";
+    public string MatchDate { get; set; } = "";
+    public string StartTime { get; set; } = "";
+    public string EndTime { get; set; } = "";
+}
+
+public class SaveHeatResultRequest
+{
+    public int RoundNumber { get; set; }
+    [Required] public string TeamId { get; set; } = null!;
+    public string Result { get; set; } = "";
+}
+
+public class AdvanceHeatsRoundRequest
+{
+    public int FromRound { get; set; }
+    public List<string> AdvancingIds { get; set; } = new();
+}
+
+public class AssignHeatPlacesRequest
+{
+    public Dictionary<string, int> Places { get; set; } = new();
+}

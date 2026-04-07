@@ -12,6 +12,13 @@ namespace TRS_API.Controllers;
 [ApiController, Route("api/registrations")]
 public class RegistrationsController : ControllerBase
 {
+    private static readonly HashSet<string> AllowedStatuses = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "Pending",
+        "Confirmed",
+        "Cancelled",
+    };
+
     private readonly TRSDbContext _db;
     private readonly ILogger<RegistrationsController> _log;
     private readonly IBackgroundJobQueue _jobQueue;
@@ -143,8 +150,7 @@ public class RegistrationsController : ControllerBase
 
                 var activeGroupCount = await _db.ParticipantGroups
                     .CountAsync(g => g.ProgramId == gDto.ProgramId
-                        && g.GroupStatus != "Cancelled"
-                        && g.GroupStatus != "Waitlisted");
+                        && g.GroupStatus != "Cancelled");
 
                 if (activeGroupCount >= program.MaxParticipants)
                 {
@@ -171,7 +177,6 @@ public class RegistrationsController : ControllerBase
                 var isDuplicate = await _db.ParticipantGroups
                     .AnyAsync(g => g.ProgramId == gDto.ProgramId
                         && g.GroupStatus != "Cancelled"
-                        && g.GroupStatus != "Waitlisted"
                         && g.Participants.Any(existing => incomingParticipants.Any(incoming =>
                             incoming.FullName == existing.FullName
                             && incoming.Dob == existing.DateOfBirth)));
@@ -357,6 +362,9 @@ public class RegistrationsController : ControllerBase
     [HttpPatch("{id:int}/status"), Authorize(Roles = "superadmin,eventadmin")]
     public async Task<IActionResult> UpdateStatus(int id, [FromBody] UpdateRegStatusRequest req)
     {
+        if (!AllowedStatuses.Contains(req.Status))
+            return BadRequest(new { code = "INVALID_STATUS", message = "Status must be Pending, Confirmed, or Cancelled." });
+
         var reg = await _db.EventRegistrations.FindAsync(id);
         if (reg == null) return NotFound(new { code = "NOT_FOUND", message = "Registration not found." });
         reg.RegStatus = req.Status;
@@ -372,6 +380,9 @@ public class RegistrationsController : ControllerBase
     [HttpPatch("{id:int}/groups/{gid:int}/status"), Authorize(Roles = "superadmin,eventadmin")]
     public async Task<IActionResult> UpdateGroupStatus(int id, int gid, [FromBody] UpdateRegStatusRequest req)
     {
+        if (!AllowedStatuses.Contains(req.Status))
+            return BadRequest(new { code = "INVALID_STATUS", message = "Status must be Pending, Confirmed, or Cancelled." });
+
         var group = await _db.ParticipantGroups
             .FirstOrDefaultAsync(g => g.GroupId == gid && g.RegistrationId == id);
         if (group == null) return NotFound(new { code = "NOT_FOUND", message = "Group not found." });
@@ -604,7 +615,6 @@ public class RegistrationsController : ControllerBase
             confirmed = all.Count(r => r.RegStatus == "Confirmed"),
             pending = all.Count(r => r.RegStatus == "Pending"),
             cancelled = all.Count(r => r.RegStatus == "Cancelled"),
-            waitlisted = all.Count(r => r.RegStatus == "Waitlisted"),
             totalRevenue = all.Where(r => r.Payments.Any(p => p.PaymentStatus == "S"))
                              .Sum(r => r.Payments.Where(p => p.PaymentStatus == "S").Sum(p => p.Amount)),
             pendingPayments = all.Count(r => r.Payments.Any(p => p.PaymentStatus == "P")),

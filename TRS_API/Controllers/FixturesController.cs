@@ -12,14 +12,11 @@ public class FixturesController : ControllerBase
 {
     private readonly TRSDbContext _db;
     private readonly AuthService _auth;
-    public FixturesController(TRSDbContext db, AuthService auth) => (_db, _auth) = (db, auth);
+    private readonly FixtureGenerationService _fixtureGeneration;
 
-    // GET /api/fixtures/status?programIds=1,2,3
-    // Returns { "1": true, "2": false, ... } — true means a fixture row exists in the DB.
-    // Used by the Fixtures table on mount to show Draw/Results status badges without
-    // loading every full bracket JSON.
-    // NOTE: this route must be declared BEFORE the {eventId}/{programId} route so ASP.NET
-    // Core does not try to bind "status" as an int for eventId.
+    public FixturesController(TRSDbContext db, AuthService auth, FixtureGenerationService fixtureGeneration)
+        => (_db, _auth, _fixtureGeneration) = (db, auth, fixtureGeneration);
+
     [HttpGet("status")]
     public async Task<IActionResult> GetStatus([FromQuery] string? programIds)
     {
@@ -41,17 +38,16 @@ public class FixturesController : ControllerBase
             .Select(f => f.ProgramId)
             .ToListAsync();
 
-        // Return string keys to match the frontend Record<string, boolean> type
         var result = ids.ToDictionary(id => id.ToString(), id => existing.Contains(id));
         return Ok(result);
     }
 
-    // GET /api/fixtures/:eventId/:programId
     [HttpGet("{eventId:int}/{programId:int}")]
     public async Task<IActionResult> Get(int eventId, int programId)
     {
         var f = await _db.Fixtures.FirstOrDefaultAsync(x => x.EventId == eventId && x.ProgramId == programId);
         if (f == null) return Ok(null);
+
         return Ok(new
         {
             eventId,
@@ -61,11 +57,100 @@ public class FixturesController : ControllerBase
             f.IsLocked,
             f.Phase,
             bracketStateJson = f.BracketStateJson,
-            f.UpdatedAt
+            f.UpdatedAt,
         });
     }
 
-    // POST /api/fixtures/:eventId/:programId  — create or overwrite
+    [HttpPost("{eventId:int}/{programId:int}/generate")]
+    public async Task<IActionResult> Generate(int eventId, int programId, [FromBody] GenerateFixtureRequest req)
+    {
+        var result = await _fixtureGeneration.GenerateAsync(eventId, programId, req);
+        if (!result.Success)
+            return BadRequest(new { code = result.Code, message = result.Message });
+
+        return Ok(result.State);
+    }
+
+    [HttpPost("{eventId:int}/{programId:int}/swap")]
+    public async Task<IActionResult> Swap(int eventId, int programId, [FromBody] SwapFixtureTeamsRequest req)
+    {
+        var result = await _fixtureGeneration.SwapTeamsAsync(eventId, programId, req);
+        if (!result.Success)
+            return BadRequest(new { code = result.Code, message = result.Message });
+
+        return Ok(result.State);
+    }
+
+    [HttpPost("{eventId:int}/{programId:int}/advance-to-knockout")]
+    public async Task<IActionResult> AdvanceToKnockout(int eventId, int programId)
+    {
+        var result = await _fixtureGeneration.AdvanceToKnockoutAsync(eventId, programId);
+        if (!result.Success)
+            return BadRequest(new { code = result.Code, message = result.Message });
+
+        return Ok(result.State);
+    }
+
+    [HttpPost("{eventId:int}/{programId:int}/advance-round")]
+    public async Task<IActionResult> AdvanceRound(int eventId, int programId)
+    {
+        var result = await _fixtureGeneration.AdvanceKnockoutRoundAsync(eventId, programId);
+        if (!result.Success)
+            return BadRequest(new { code = result.Code, message = result.Message });
+
+        return Ok(result.State);
+    }
+
+    [HttpPatch("{eventId:int}/{programId:int}/score/{matchId}")]
+    public async Task<IActionResult> SaveScore(int eventId, int programId, string matchId, [FromBody] SaveFixtureScoreRequest req)
+    {
+        var result = await _fixtureGeneration.SaveScoreAsync(eventId, programId, matchId, req);
+        if (!result.Success)
+            return BadRequest(new { code = result.Code, message = result.Message });
+
+        return Ok(result.State);
+    }
+
+    [HttpPatch("{eventId:int}/{programId:int}/schedule/{matchId}")]
+    public async Task<IActionResult> UpdateSchedule(int eventId, int programId, string matchId, [FromBody] UpdateFixtureScheduleRequest req)
+    {
+        var result = await _fixtureGeneration.UpdateScheduleAsync(eventId, programId, matchId, req);
+        if (!result.Success)
+            return BadRequest(new { code = result.Code, message = result.Message });
+
+        return Ok(result.State);
+    }
+
+    [HttpPatch("{eventId:int}/{programId:int}/heats/result")]
+    public async Task<IActionResult> SaveHeatResult(int eventId, int programId, [FromBody] SaveHeatResultRequest req)
+    {
+        var result = await _fixtureGeneration.SaveHeatResultAsync(eventId, programId, req);
+        if (!result.Success)
+            return BadRequest(new { code = result.Code, message = result.Message });
+
+        return Ok(result.State);
+    }
+
+    [HttpPost("{eventId:int}/{programId:int}/heats/advance")]
+    public async Task<IActionResult> AdvanceHeatsRound(int eventId, int programId, [FromBody] AdvanceHeatsRoundRequest req)
+    {
+        var result = await _fixtureGeneration.AdvanceHeatsRoundAsync(eventId, programId, req);
+        if (!result.Success)
+            return BadRequest(new { code = result.Code, message = result.Message });
+
+        return Ok(result.State);
+    }
+
+    [HttpPost("{eventId:int}/{programId:int}/heats/places")]
+    public async Task<IActionResult> AssignHeatPlaces(int eventId, int programId, [FromBody] AssignHeatPlacesRequest req)
+    {
+        var result = await _fixtureGeneration.AssignHeatPlacesAsync(eventId, programId, req);
+        if (!result.Success)
+            return BadRequest(new { code = result.Code, message = result.Message });
+
+        return Ok(result.State);
+    }
+
     [HttpPost("{eventId:int}/{programId:int}")]
     public async Task<IActionResult> Save(int eventId, int programId, [FromBody] SaveFixtureRequest req)
     {
@@ -77,25 +162,31 @@ public class FixturesController : ControllerBase
                 EventId = eventId,
                 ProgramId = programId,
                 CreatedAt = DateTime.UtcNow,
-                GeneratedBy = _auth.GetUserId(User)
+                GeneratedBy = _auth.GetUserId(User),
             };
             _db.Fixtures.Add(f);
         }
+
         f.BracketStateJson = req.BracketStateJson;
         f.FixtureFormat = req.FixtureFormat;
         f.Phase = req.Phase;
         f.IsLocked = req.IsLocked;
         f.UpdatedAt = DateTime.UtcNow;
         await _db.SaveChangesAsync();
+
         return Ok(new { eventId, programId, f.FixtureFormat, f.IsLocked, f.Phase });
     }
 
-    // DELETE /api/fixtures/:eventId/:programId  — reset fixture
     [HttpDelete("{eventId:int}/{programId:int}")]
     public async Task<IActionResult> Delete(int eventId, int programId)
     {
         var f = await _db.Fixtures.FirstOrDefaultAsync(x => x.EventId == eventId && x.ProgramId == programId);
-        if (f != null) { _db.Fixtures.Remove(f); await _db.SaveChangesAsync(); }
+        if (f != null)
+        {
+            _db.Fixtures.Remove(f);
+            await _db.SaveChangesAsync();
+        }
+
         return Ok();
     }
 }

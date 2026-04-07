@@ -69,6 +69,7 @@ builder.Services.AddAuthorization();
 
 // App services
 builder.Services.AddScoped<AuthService>();
+builder.Services.AddScoped<FixtureGenerationService>();
 builder.Services.AddSingleton<IBackgroundJobQueue, BackgroundJobQueue>();
 builder.Services.AddHostedService<BackgroundJobWorker>();
 builder.Services.AddHostedService<PaymentCleanupWorker>();
