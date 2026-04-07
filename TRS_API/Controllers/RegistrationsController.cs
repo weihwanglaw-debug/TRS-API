@@ -14,9 +14,16 @@ public class RegistrationsController : ControllerBase
 {
     private readonly TRSDbContext _db;
     private readonly ILogger<RegistrationsController> _log;
+    private readonly IBackgroundJobQueue _jobQueue;
     private readonly ReceiptService _receipt;
-    public RegistrationsController(TRSDbContext db, ILogger<RegistrationsController> log, ReceiptService receipt)
-        => (_db, _log, _receipt) = (db, log, receipt);
+    private readonly IServiceScopeFactory _serviceScopeFactory;
+    public RegistrationsController(
+        TRSDbContext db,
+        ILogger<RegistrationsController> log,
+        ReceiptService receipt,
+        IBackgroundJobQueue jobQueue,
+        IServiceScopeFactory serviceScopeFactory)
+        => (_db, _log, _receipt, _jobQueue, _serviceScopeFactory) = (db, log, receipt, jobQueue, serviceScopeFactory);
 
     // ── GET /api/registrations  ── admin, paged + filtered ─────────────────
     [HttpGet, Authorize(Roles = "superadmin,eventadmin")]
@@ -149,11 +156,25 @@ public class RegistrationsController : ControllerBase
                     });
                 }
 
-                // ── Duplicate check ───────────────────────────────────────────
+                // ── Duplicate check (participant identity: name + DOB) ────────
+                // Matches on the actual participants being registered, not the
+                // contact email — this allows a parent to register two different
+                // children in the same program under their own email address.
+                var incomingParticipants = gDto.Participants
+                    .Select(p => new
+                    {
+                        p.FullName,
+                        Dob = string.IsNullOrWhiteSpace(p.Dob) ? (DateOnly?)null : DateOnly.Parse(p.Dob),
+                    })
+                    .ToList();
+
                 var isDuplicate = await _db.ParticipantGroups
                     .AnyAsync(g => g.ProgramId == gDto.ProgramId
                         && g.GroupStatus != "Cancelled"
-                        && g.Registration.ContactEmail == req.ContactEmail);
+                        && g.GroupStatus != "Waitlisted"
+                        && g.Participants.Any(existing => incomingParticipants.Any(incoming =>
+                            incoming.FullName == existing.FullName
+                            && incoming.Dob == existing.DateOfBirth)));
 
                 if (isDuplicate)
                 {
@@ -161,7 +182,7 @@ public class RegistrationsController : ControllerBase
                     return BadRequest(new
                     {
                         code = "DUPLICATE_REGISTRATION",
-                        message = $"'{req.ContactEmail}' is already registered for '{gDto.ProgramName}'."
+                        message = $"One or more participants are already registered for '{gDto.ProgramName}'."
                     });
                 }
 
@@ -258,6 +279,11 @@ public class RegistrationsController : ControllerBase
                 groups.Add(group);
             }
 
+            var isFreeRegistration = reg.TotalAmount == 0;
+            var receiptNo = isFreeRegistration
+                ? $"TRS-{DateTime.UtcNow:yyyyMMdd}-{Random.Shared.Next(10000, 99999):D5}"
+                : null;
+
             // Payment record
             var payment = new Payment
             {
@@ -267,16 +293,54 @@ public class RegistrationsController : ControllerBase
                 PaymentMethod = req.Payment.Method,
                 Amount = req.Payment.Amount,
                 Currency = req.Payment.Currency,
-                PaymentStatus = "P",
+                PaymentStatus = isFreeRegistration ? "S" : "P",
                 CreatedAt = DateTime.UtcNow,
+                PaidAt = isFreeRegistration ? DateTime.UtcNow : null,
+                ReceiptNumber = receiptNo,
             };
             _db.Payments.Add(payment);
             await _db.SaveChangesAsync();
 
-            foreach (var item in allItems) { item.PaymentId = payment.PaymentId; _db.PaymentItems.Add(item); }
-            await _db.SaveChangesAsync();
+            foreach (var item in allItems)
+            {
+                item.PaymentId = payment.PaymentId;
+                if (isFreeRegistration) item.ItemStatus = "S";
+                _db.PaymentItems.Add(item);
+            }
 
+            if (isFreeRegistration)
+            {
+                reg.RegStatus = "Confirmed";
+                reg.RegistrationStatus = "C";
+                reg.ConfirmedAt = DateTime.UtcNow;
+                foreach (var group in groups) group.GroupStatus = "Confirmed";
+            }
+
+            await _db.SaveChangesAsync();
             await tx.CommitAsync();
+
+            if (isFreeRegistration)
+            {
+                var regIdForJob = reg.RegistrationId;
+                var payIdForJob = payment.PaymentId;
+                await _jobQueue.EnqueueAsync(async ct =>
+                {
+                    using var scope = _serviceScopeFactory.CreateScope();
+                    var receiptSvc = scope.ServiceProvider.GetRequiredService<ReceiptService>();
+                    var emailSvc = scope.ServiceProvider.GetRequiredService<EmailService>();
+                    var jobDb = scope.ServiceProvider.GetRequiredService<TRSDbContext>();
+                    try
+                    {
+                        var pdfBytes = await receiptSvc.GenerateAsync(jobDb, regIdForJob);
+                        await emailSvc.SendPaymentConfirmationAsync(jobDb, regIdForJob, pdfBytes, ct);
+                        _log.LogInformation("Receipt generated for free registration {RegId}", regIdForJob);
+                    }
+                    catch (Exception ex)
+                    {
+                        _log.LogError(ex, "Failed to generate receipt for free registration payment {PaymentId}", payIdForJob);
+                    }
+                });
+            }
 
             var created = await LoadReg(reg.RegistrationId);
             return Ok(MapReg(created!));
