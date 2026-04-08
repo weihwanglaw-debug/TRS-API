@@ -310,8 +310,11 @@ public class FixtureGenerationService
     private FixtureGenerationResult NormalizeSeeds(List<ParticipantGroup> groups, List<FixtureSeedEntryRequest> requested)
     {
         var requestedById = requested.ToDictionary(s => s.Id, StringComparer.Ordinal);
-        var actualIds = groups.Select(g => g.GroupId.ToString()).OrderBy(x => x).ToList();
-        var requestedIds = requestedById.Keys.OrderBy(x => x).ToList();
+        var actualIds = groups.Select(g => g.GroupId).OrderBy(x => x).ToList();
+        var requestedIds = requestedById.Keys
+            .Select(id => int.TryParse(id, out var parsed) ? parsed : -1)
+            .OrderBy(x => x)
+            .ToList();
         if (!actualIds.SequenceEqual(requestedIds))
             return FixtureGenerationResult.Fail("PARTICIPANTS_CHANGED", "Registered entries changed. Reload the page and try again.");
 
@@ -357,7 +360,6 @@ public class FixtureGenerationService
             NumSeeds = req.NumSeeds,
             NumGroups = req.NumGroups,
             AdvancePerGroup = req.AdvancePerGroup,
-            CrossGroupPairing = req.CrossGroupPairing,
             StandingPoints = req.StandingPoints == null ? null : new StandingPoints
             {
                 Win = req.StandingPoints.Win,
@@ -503,11 +505,17 @@ public class FixtureGenerationService
         var t2B = team2.Id == idB;
         if (!t1A && !t1B && !t2A && !t2B) return;
 
-        if (t1A) match.Team1 = team2;
-        else if (t1B) match.Team1 = team1;
+        var newTeam1 = team1;
+        var newTeam2 = team2;
 
-        if (t2B) match.Team2 = team1;
-        else if (t2A) match.Team2 = team2;
+        if (t1A) newTeam1 = team2;
+        else if (t1B) newTeam1 = team1;
+
+        if (t2B) newTeam2 = team1;
+        else if (t2A) newTeam2 = team2;
+
+        match.Team1 = newTeam1;
+        match.Team2 = newTeam2;
     }
 
     private List<FixtureMatch> GenerateKnockoutFromGroups(List<FixtureGroup> groups, FixtureConfig config)
@@ -518,7 +526,7 @@ public class FixtureGenerationService
             .ToList();
 
         var paired = new List<(FixtureTeam Team1, FixtureTeam Team2)>();
-        if (string.Equals(config.CrossGroupPairing, "bwf", StringComparison.OrdinalIgnoreCase) && groups.Count == 2)
+        if (groups.Count == 2)
         {
             var groupA = advancers.ElementAtOrDefault(0) ?? new List<FixtureTeam>();
             var groupB = advancers.ElementAtOrDefault(1) ?? new List<FixtureTeam>();
@@ -931,7 +939,6 @@ public class FixtureGenerationService
         public int NumSeeds { get; set; }
         public int? NumGroups { get; set; }
         public int? AdvancePerGroup { get; set; }
-        public string? CrossGroupPairing { get; set; }
         public StandingPoints? StandingPoints { get; set; }
         public HeatsConfig? HeatsConfig { get; set; }
     }

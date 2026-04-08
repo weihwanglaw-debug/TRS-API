@@ -187,7 +187,6 @@ public class FixtureConfigRequest
     public int NumSeeds { get; set; }
     public int? NumGroups { get; set; }
     public int? AdvancePerGroup { get; set; }
-    public string? CrossGroupPairing { get; set; }
     public StandingPointsRequest? StandingPoints { get; set; }
     public HeatsConfigRequest? HeatsConfig { get; set; }
 }
