@@ -111,14 +111,29 @@ public class FixtureGenerationService
             else if (seed.Id == req.IdB) seed.Seed = seedA;
         }
 
+        var seedsById = state.Seeds.ToDictionary(s => s.Id, StringComparer.Ordinal);
+        FixtureTeam SwapTeam(FixtureTeam t)
+        {
+            if (t.Id == req.IdA) return ToTeam(seedsById[req.IdB]);
+            if (t.Id == req.IdB) return ToTeam(seedsById[req.IdA]);
+            return t;
+        }
+
         foreach (var group in state.Groups)
         {
+            group.Teams = group.Teams.Select(SwapTeam).ToList();
             foreach (var match in group.Matches)
-                SwapTeams(match, req.IdA, req.IdB);
+            {
+                match.Team1 = SwapTeam(match.Team1);
+                match.Team2 = SwapTeam(match.Team2);
+            }
         }
 
         foreach (var match in state.Matches)
-            SwapTeams(match, req.IdA, req.IdB);
+        {
+            match.Team1 = SwapTeam(match.Team1);
+            match.Team2 = SwapTeam(match.Team2);
+        }
 
         if (state.HeatRounds != null)
         {
@@ -255,6 +270,8 @@ public class FixtureGenerationService
         var round = rounds.FirstOrDefault(r => r.RoundNumber == req.FromRound);
         if (round == null)
             return FixtureGenerationResult.Fail("NOT_FOUND", "Heat round not found.");
+        if (round.IsComplete)
+            return FixtureGenerationResult.Fail("ALREADY_COMPLETE", "This round has already been advanced.");
 
         var nextRound = rounds.FirstOrDefault(r => r.RoundNumber == req.FromRound + 1);
         if (nextRound == null)
@@ -493,29 +510,6 @@ public class FixtureGenerationService
         }
 
         return state.Matches.FirstOrDefault(m => m.Id == matchId);
-    }
-
-    private void SwapTeams(FixtureMatch match, string idA, string idB)
-    {
-        var team1 = match.Team1;
-        var team2 = match.Team2;
-        var t1A = team1.Id == idA;
-        var t1B = team1.Id == idB;
-        var t2A = team2.Id == idA;
-        var t2B = team2.Id == idB;
-        if (!t1A && !t1B && !t2A && !t2B) return;
-
-        var newTeam1 = team1;
-        var newTeam2 = team2;
-
-        if (t1A) newTeam1 = team2;
-        else if (t1B) newTeam1 = team1;
-
-        if (t2B) newTeam2 = team1;
-        else if (t2A) newTeam2 = team2;
-
-        match.Team1 = newTeam1;
-        match.Team2 = newTeam2;
     }
 
     private List<FixtureMatch> GenerateKnockoutFromGroups(List<FixtureGroup> groups, FixtureConfig config)
@@ -851,7 +845,7 @@ public class FixtureGenerationService
 
     private FixtureMatch BlankMatch(FixtureTeam team1, FixtureTeam team2, int round, string phase, string? groupId = null) => new()
     {
-        Id = $"M-{Guid.NewGuid():N}"[..6].Insert(1, "-"),
+        Id = $"M-{Guid.NewGuid():N}",
         Phase = phase,
         Round = round,
         RoundLabel = "",
