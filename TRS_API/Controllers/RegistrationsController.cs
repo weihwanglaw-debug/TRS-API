@@ -371,6 +371,19 @@ public class RegistrationsController : ControllerBase
         reg.RegistrationStatus = req.Status switch { "Confirmed" => "C", "Cancelled" => "X", _ => "P" };
         if (req.Status == "Confirmed") reg.ConfirmedAt = DateTime.UtcNow;
         reg.UpdatedAt = DateTime.UtcNow;
+
+        // Cascade the same status to every participant group so that capacity
+        // counts (which exclude GroupStatus = "Cancelled") and the fixture
+        // participant list stay in sync with the registration-level status.
+        var groups = await _db.ParticipantGroups
+            .Where(g => g.RegistrationId == id)
+            .ToListAsync();
+        foreach (var g in groups)
+        {
+            g.GroupStatus = req.Status;
+            g.UpdatedAt = DateTime.UtcNow;
+        }
+
         await _db.SaveChangesAsync();
         var updated = await LoadReg(id);
         return Ok(MapReg(updated!));
