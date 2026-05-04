@@ -62,6 +62,7 @@ public class UpsertProgramRequest
 {
     [Required] public string Name { get; set; } = null!;
     [Required] public string Type { get; set; } = null!;
+    public string? SbaRankingType { get; set; }
     public int MinAge { get; set; }
     public int MaxAge { get; set; } = 99;
     [Required] public string Gender { get; set; } = null!;

@@ -6,6 +6,7 @@ public partial class TrsProgram
     public int EventId { get; set; }
     public string Name { get; set; } = null!;
     public string Type { get; set; } = null!;
+    public string? SbaRankingType { get; set; }
     public int MinAge { get; set; }
     public int MaxAge { get; set; }
     public string Gender { get; set; } = null!;

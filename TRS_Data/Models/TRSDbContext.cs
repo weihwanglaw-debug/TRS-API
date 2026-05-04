@@ -98,6 +98,7 @@ public partial class TRSDbContext : DbContext
             e.Property(x => x.EventId).HasColumnName("EventID");
             e.Property(x => x.Name).HasMaxLength(300);
             e.Property(x => x.Type).HasMaxLength(100);
+            e.Property(x => x.SbaRankingType).HasMaxLength(80);
             e.Property(x => x.Gender).HasMaxLength(20);
             e.Property(x => x.Fee).HasColumnType("decimal(10,2)");
             e.Property(x => x.FeeStructure).HasMaxLength(10).IsUnicode(false).HasDefaultValue("per_entry");
@@ -137,12 +138,17 @@ public partial class TRSDbContext : DbContext
 
         // SbaRankings
         mb.Entity<SbaRanking>(e => {
-            e.HasKey(x => x.SbaId).HasName("PK_SbaRankings");
-            e.Property(x => x.SbaId).HasColumnName("SbaID").HasMaxLength(20).IsUnicode(false);
-            e.Property(x => x.Name).HasMaxLength(200);
-            e.Property(x => x.Club).HasMaxLength(200);
-            e.Property(x => x.Gender).HasMaxLength(10).IsUnicode(false);
+            e.HasKey(x => x.SbaRankingId).HasName("PK_SbaRankings");
+            e.Property(x => x.SbaRankingId).HasColumnName("SbaRankingID");
+            e.Property(x => x.RankingType).HasMaxLength(80);
+            e.Property(x => x.Player1SbaId).HasColumnName("Player1SbaID").HasMaxLength(20).IsUnicode(false);
+            e.Property(x => x.Player1Name).HasMaxLength(200);
+            e.Property(x => x.Player1Club).HasMaxLength(200);
+            e.Property(x => x.Player2SbaId).HasColumnName("Player2SbaID").HasMaxLength(20).IsUnicode(false);
+            e.Property(x => x.Player2Name).HasMaxLength(200);
+            e.Property(x => x.Player2Club).HasMaxLength(200);
             e.Property(x => x.UpdatedAt).HasDefaultValueSql("(sysutcdatetime())");
+            e.HasIndex(x => new { x.RankingType, x.Player1SbaId, x.Player2SbaId }).IsUnique().HasDatabaseName("UX_SbaRankings_Type_Players");
         });
 
         // EventRegistrations

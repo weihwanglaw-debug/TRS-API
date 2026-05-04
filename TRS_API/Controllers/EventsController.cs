@@ -146,6 +146,7 @@ public class EventsController : ControllerBase
     private static TrsProgram ApplyProgramFields(TrsProgram p, UpsertProgramRequest r)
     {
         p.Name = r.Name; p.Type = r.Type; p.MinAge = r.MinAge; p.MaxAge = r.MaxAge;
+        p.SbaRankingType = string.IsNullOrWhiteSpace(r.SbaRankingType) ? null : r.SbaRankingType.Trim();
         p.Gender = r.Gender; p.Fee = r.Fee; p.PaymentRequired = r.PaymentRequired;
         p.FeeStructure = r.FeeStructure; p.SbaRequired = r.SbaRequired;
         p.MinPlayers = r.MinPlayers; p.MaxPlayers = r.MaxPlayers;
@@ -183,6 +184,7 @@ public class EventsController : ControllerBase
         id = p.ProgramId.ToString(),
         p.Name,
         p.Type,
+        p.SbaRankingType,
         p.MinAge,
         p.MaxAge,
         p.Gender,
