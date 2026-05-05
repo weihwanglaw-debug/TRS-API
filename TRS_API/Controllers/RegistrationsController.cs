@@ -221,6 +221,7 @@ public class RegistrationsController : ControllerBase
                         SbaId = pDto.SbaId,
                         GuardianName = pDto.GuardianName,
                         GuardianContact = pDto.GuardianContact,
+                        DocumentUrl = pDto.DocumentUrl,
                         Remark = pDto.Remark,
                         CreatedAt = DateTime.UtcNow,
                     };

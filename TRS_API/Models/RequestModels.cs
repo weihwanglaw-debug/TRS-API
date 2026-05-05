@@ -126,6 +126,7 @@ public class CreateParticipantDto
     public string? SbaId { get; set; }
     public string? GuardianName { get; set; }
     public string? GuardianContact { get; set; }
+    public string? DocumentUrl { get; set; }
     public string? Remark { get; set; }
     public Dictionary<string, string> CustomFieldValues { get; set; } = new();
 }
