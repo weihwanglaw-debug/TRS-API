@@ -46,7 +46,7 @@ public class FixturesController : ControllerBase
     public async Task<IActionResult> Get(int eventId, int programId)
     {
         var f = await _db.Fixtures.FirstOrDefaultAsync(x => x.EventId == eventId && x.ProgramId == programId);
-        if (f == null) return Ok(null);
+        if (f == null) return Ok(new { fixture = (object?)null });
 
         return Ok(new
         {
