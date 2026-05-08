@@ -7,6 +7,8 @@ public partial class WebhookLog
 {
     public int WebhookLogId { get; set; }
 
+    public int? PaymentId { get; set; }       // FK → Payments — nullable (set after payment matched)
+
     public string PaymentGateway { get; set; } = null!;
 
     public string GatewayEventId { get; set; } = null!;

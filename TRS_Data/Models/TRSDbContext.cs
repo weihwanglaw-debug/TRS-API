@@ -17,7 +17,7 @@ public partial class TRSDbContext : DbContext
     public virtual DbSet<SbaRanking>                 SbaRankings                { get; set; }
     public virtual DbSet<EventRegistration>          EventRegistrations         { get; set; }
     public virtual DbSet<ParticipantGroup>           ParticipantGroups          { get; set; }
-    public virtual DbSet<Participant>             Participants            { get; set; }
+    public virtual DbSet<Participant>                Participants               { get; set; }
     public virtual DbSet<ParticipantCustomFieldValue> ParticipantCustomFieldValues { get; set; }
     public virtual DbSet<EventParticipant>           EventParticipants          { get; set; }
     public virtual DbSet<Payment>                    Payments                   { get; set; }
@@ -148,7 +148,8 @@ public partial class TRSDbContext : DbContext
             e.Property(x => x.Player2Name).HasMaxLength(200);
             e.Property(x => x.Player2Club).HasMaxLength(200);
             e.Property(x => x.UpdatedAt).HasDefaultValueSql("(sysutcdatetime())");
-            e.HasIndex(x => new { x.RankingType, x.Player1SbaId, x.Player2SbaId }).IsUnique().HasDatabaseName("UX_SbaRankings_Type_Players");
+            e.HasIndex(x => new { x.RankingType, x.Player1SbaId, x.Player2SbaId }).IsUnique()
+             .HasDatabaseName("UX_SbaRankings_Type_Players");
         });
 
         // EventRegistrations
@@ -193,7 +194,7 @@ public partial class TRSDbContext : DbContext
              .HasForeignKey(x => x.ProgramId).HasConstraintName("FK_ParticipantGroups_Program");
         });
 
-        // Participants (table name Participants)
+        // Participants
         mb.Entity<Participant>(e => {
             e.ToTable("Participants");
             e.HasKey(x => x.ParticipantId).HasName("PK_Participants");
@@ -347,7 +348,11 @@ public partial class TRSDbContext : DbContext
             e.Property(x => x.PayloadJson).HasColumnName("PayloadJSON");
             e.Property(x => x.ProcessingStatus).HasMaxLength(1).IsUnicode(false).IsFixedLength().HasDefaultValue("P");
             e.Property(x => x.ReceivedAt).HasDefaultValueSql("(getdate())");
+            e.Property(x => x.PaymentId).HasColumnName("PaymentID");
             e.HasIndex(x => x.GatewayEventId).IsUnique().HasDatabaseName("UQ_WebhookLogs_GatewayEventID");
+            e.HasOne<Payment>().WithMany()
+             .HasForeignKey(x => x.PaymentId).IsRequired(false)
+             .HasConstraintName("FK_WebhookLogs_Payment");
         });
 
         // BackgroundJobs

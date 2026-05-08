@@ -100,6 +100,21 @@ public class EventsController : ControllerBase
         return Ok(MapProgram(prog, 0));
     }
 
+
+    // PATCH /api/events/:eid/programs/:pid/status  — admin
+    [HttpPatch("{eid:int}/programs/{pid:int}/status"), Authorize(Roles = "superadmin,eventadmin")]
+    public async Task<IActionResult> UpdateProgramStatus(int eid, int pid, [FromBody] UpdateProgramStatusRequest req)
+    {
+        var prog = await _db.Programs.FirstOrDefaultAsync(p => p.ProgramId == pid && p.EventId == eid);
+        if (prog == null) return NotFound(new { code = "NOT_FOUND", message = "Program not found." });
+        if (req.Status != "open" && req.Status != "closed")
+            return BadRequest(new { code = "INVALID_STATUS", message = "Status must be 'open' or 'closed'." });
+        prog.Status = req.Status;
+        prog.UpdatedAt = DateTime.UtcNow;
+        await _db.SaveChangesAsync();
+        return Ok(new { programId = pid, status = prog.Status });
+    }
+
     // DELETE /api/events/:eid/programs/:pid  — admin
     [HttpDelete("{eid:int}/programs/{pid:int}"), Authorize(Roles = "superadmin,eventadmin")]
     public async Task<IActionResult> DeleteProgram(int eid, int pid)

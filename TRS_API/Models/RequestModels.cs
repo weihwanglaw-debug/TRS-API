@@ -145,6 +145,10 @@ public class CreatePaymentItemDto
     public decimal Amount { get; set; }
     public int? ParticipantIndex { get; set; }   // for per_player: index into group.Participants
 }
+public class UpdateProgramStatusRequest
+{
+    [Required] public string Status { get; set; } = null!;  // "open" | "closed"
+}
 public class UpdateRegStatusRequest
 {
     [Required] public string Status { get; set; } = null!;
