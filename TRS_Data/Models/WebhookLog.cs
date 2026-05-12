@@ -17,11 +17,11 @@ public partial class WebhookLog
 
     public string PayloadJson { get; set; } = null!;
 
-    public string ProcessingStatus { get; set; } = null!;
+    public string ProcessingStatus { get; set; } = "P";   // P|S|F|I
 
     public string? ErrorMessage { get; set; }
 
-    public DateTime ReceivedAt { get; set; }
+    public DateTime ReceivedAt { get; set; } = DateTime.UtcNow;
 
     public DateTime? ProcessedAt { get; set; }
 }

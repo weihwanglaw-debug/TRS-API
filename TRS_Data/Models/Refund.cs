@@ -12,7 +12,7 @@ public partial class Refund
     public string RefundStatus { get; set; } = "P";    // P|S|F
     public string? RequestedBy { get; set; }
     public string? ApprovedBy { get; set; }
-    public DateTime CreatedAt { get; set; }
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
     public DateTime? ProcessedAt { get; set; }
     public virtual Payment Payment { get; set; } = null!;
     public virtual PaymentItem PaymentItem { get; set; } = null!;

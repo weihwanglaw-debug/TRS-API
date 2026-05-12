@@ -166,20 +166,25 @@ public class RegistrationsController : ControllerBase
                 // Matches on the actual participants being registered, not the
                 // contact email — this allows a parent to register two different
                 // children in the same program under their own email address.
+                                // Duplicate check (participant identity)
                 var incomingParticipants = gDto.Participants
                     .Select(p => new
                     {
                         p.FullName,
                         Dob = string.IsNullOrWhiteSpace(p.Dob) ? (DateOnly?)null : DateOnly.Parse(p.Dob),
-                    })
-                    .ToList();
+                    }).ToList();
 
-                var isDuplicate = await _db.ParticipantGroups
-                    .AnyAsync(g => g.ProgramId == gDto.ProgramId
-                        && g.GroupStatus != "Cancelled"
-                        && g.Participants.Any(existing => incomingParticipants.Any(incoming =>
-                            incoming.FullName == existing.FullName
-                            && incoming.Dob == existing.DateOfBirth)));
+                    var existingParticipants = await _db.ParticipantGroups
+                        .Where(g => g.ProgramId == gDto.ProgramId && g.GroupStatus != "Cancelled")
+                        .SelectMany(g => g.Participants)
+                        .Select(p => new { p.FullName, p.DateOfBirth })
+                        .ToListAsync();
+
+                    var isDuplicate = incomingParticipants.Any(incoming =>
+                        existingParticipants.Any(existing =>
+                            existing.FullName == incoming.FullName
+                            && existing.DateOfBirth == incoming.Dob));
+
 
                 if (isDuplicate)
                 {

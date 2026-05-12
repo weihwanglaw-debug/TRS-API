@@ -16,7 +16,7 @@ public partial class Payment
     public string PaymentStatus { get; set; } = "P";   // P|S|PR|FR|F|X
     public string? ReceiptNumber { get; set; }
     public string? PaymentGatewayResponse { get; set; }
-    public DateTime CreatedAt { get; set; }
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
     public DateTime? UpdatedAt { get; set; }
     public DateTime? PaidAt { get; set; }
     public virtual EventRegistration Registration { get; set; } = null!;

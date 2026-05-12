@@ -130,7 +130,9 @@ public partial class TRSDbContext : DbContext
             e.HasKey(x => x.CustomFieldId).HasName("PK_ProgramCustomFields");
             e.Property(x => x.CustomFieldId).HasColumnName("CustomFieldID");
             e.Property(x => x.Label).HasMaxLength(200);
-            e.Property(x => x.FieldType).HasMaxLength(20).IsUnicode(false).HasDefaultValue("text");
+            // DB has no DEFAULT for FieldType — EF supplies it from the model initialiser.
+            // HasDefaultValue removed to keep the model authoritative and avoid migration noise.
+            e.Property(x => x.FieldType).HasMaxLength(20).IsUnicode(false);
             e.HasOne(x => x.Program).WithMany(x => x.CustomFields)
              .HasForeignKey(x => x.ProgramId).OnDelete(DeleteBehavior.Cascade)
              .HasConstraintName("FK_ProgramCustomFields_Program");
@@ -148,13 +150,20 @@ public partial class TRSDbContext : DbContext
             e.Property(x => x.Player2Name).HasMaxLength(200);
             e.Property(x => x.Player2Club).HasMaxLength(200);
             e.Property(x => x.UpdatedAt).HasDefaultValueSql("(sysutcdatetime())");
+            // Filtered unique index for doubles pairs (Player2SbaID IS NOT NULL)
             e.HasIndex(x => new { x.RankingType, x.Player1SbaId, x.Player2SbaId }).IsUnique()
-             .HasDatabaseName("UX_SbaRankings_Type_Players");
+             .HasDatabaseName("UX_SbaRankings_Type_Players")
+             .HasFilter("[Player2SbaID] IS NOT NULL");
+            // Filtered unique index for singles (Player2SbaID IS NULL)
+            e.HasIndex(x => new { x.RankingType, x.Player1SbaId }).IsUnique()
+             .HasDatabaseName("UX_SbaRankings_Type_Singles")
+             .HasFilter("[Player2SbaID] IS NULL");
         });
 
         // EventRegistrations
         mb.Entity<EventRegistration>(e => {
-            e.HasKey(x => x.RegistrationId).HasName("PK__EventReg__6EF58830A1341650");
+            // FIX: was stale auto-generated name "PK__EventReg__6EF58830A1341650"
+            e.HasKey(x => x.RegistrationId).HasName("PK_EventRegistrations");
             e.Property(x => x.RegistrationId).HasColumnName("RegistrationID");
             e.Property(x => x.EventId).HasColumnName("EventID");
             e.Property(x => x.EventName).HasMaxLength(300);
@@ -168,7 +177,8 @@ public partial class TRSDbContext : DbContext
             e.Property(x => x.TotalAmount).HasColumnType("decimal(10,2)");
             e.Property(x => x.RegistrationStatus).HasMaxLength(1).IsUnicode(false).HasDefaultValue("P");
             e.Property(x => x.NumberOfParticipants).HasDefaultValue(1);
-            e.Property(x => x.CreatedAt).HasDefaultValueSql("(getdate())");
+            // FIX: was "(getdate())" — DB uses sysutcdatetime()
+            e.Property(x => x.CreatedAt).HasDefaultValueSql("(sysutcdatetime())");
             e.HasOne(x => x.Event).WithMany()
              .HasForeignKey(x => x.EventId).HasConstraintName("FK_Registrations_Event");
         });
@@ -219,7 +229,7 @@ public partial class TRSDbContext : DbContext
 
         // ParticipantCustomFieldValues
         mb.Entity<ParticipantCustomFieldValue>(e => {
-            e.HasKey(x => x.ValueId).HasName("PK_ParticipantCFV");
+            e.HasKey(x => x.ValueId).HasName("PK_ParticipantCustomFieldValues");
             e.Property(x => x.ValueId).HasColumnName("ValueID");
             e.Property(x => x.FieldLabel).HasMaxLength(200);
             e.HasIndex(x => new { x.ParticipantId, x.CustomFieldId }).IsUnique()
@@ -233,8 +243,10 @@ public partial class TRSDbContext : DbContext
 
         // EventParticipants (legacy junction — preserved as-is)
         mb.Entity<EventParticipant>(e => {
+            // DB uses the auto-generated name — kept intentionally as it matches the actual constraint
             e.HasKey(x => x.EventParticipantId).HasName("PK__EventPar__09F32B7205B108E2");
             e.Property(x => x.EventParticipantId).HasColumnName("EventParticipantID");
+            // DB DEFAULT is getdate() for this table — correct as-is
             e.Property(x => x.CreatedAt).HasDefaultValueSql("(getdate())");
             e.Property(x => x.ParticipantId).HasColumnName("ParticipantID");
             e.Property(x => x.RegistrationId).HasColumnName("RegistrationID");
@@ -248,7 +260,8 @@ public partial class TRSDbContext : DbContext
 
         // Payments
         mb.Entity<Payment>(e => {
-            e.HasKey(x => x.PaymentId).HasName("PK__Payments__9B556A58E233D9D7");
+            // FIX: was stale auto-generated name "PK__Payments__9B556A58E233D9D7"
+            e.HasKey(x => x.PaymentId).HasName("PK_Payments");
             e.Property(x => x.PaymentId).HasColumnName("PaymentID");
             e.Property(x => x.RegistrationId).HasColumnName("RegistrationID");
             e.Property(x => x.EventId).HasColumnName("EventID");
@@ -262,7 +275,8 @@ public partial class TRSDbContext : DbContext
             e.Property(x => x.GatewayChargeId).HasMaxLength(255).IsUnicode(false).HasColumnName("GatewayChargeID");
             e.Property(x => x.ReceiptNumber).HasMaxLength(50).IsUnicode(false);
             e.Property(x => x.PaymentGatewayResponse).HasColumnType("nvarchar(max)");
-            e.Property(x => x.CreatedAt).HasDefaultValueSql("(getdate())");
+            // FIX: was "(getdate())" — DB uses sysutcdatetime()
+            e.Property(x => x.CreatedAt).HasDefaultValueSql("(sysutcdatetime())");
             e.HasIndex(x => x.RegistrationId).IsUnique().HasDatabaseName("UQ_Payments_Registration");
             e.HasIndex(x => x.GatewaySessionId).IsUnique().HasDatabaseName("UQ_Payments_GatewaySessionID")
              .HasFilter("[GatewaySessionID] IS NOT NULL");
@@ -298,7 +312,8 @@ public partial class TRSDbContext : DbContext
 
         // Refunds
         mb.Entity<Refund>(e => {
-            e.HasKey(x => x.RefundId).HasName("PK__Refunds__725AB900B01FF332");
+            // FIX: was stale auto-generated name "PK__Refunds__725AB900B01FF332"
+            e.HasKey(x => x.RefundId).HasName("PK_Refunds");
             e.Property(x => x.RefundId).HasColumnName("RefundID");
             e.Property(x => x.PaymentId).HasColumnName("PaymentID");
             e.Property(x => x.PaymentItemId).HasColumnName("PaymentItemID");
@@ -309,7 +324,8 @@ public partial class TRSDbContext : DbContext
             e.Property(x => x.RefundStatus).HasMaxLength(1).IsUnicode(false).IsFixedLength().HasDefaultValue("P");
             e.Property(x => x.RequestedBy).HasMaxLength(100);
             e.Property(x => x.ApprovedBy).HasMaxLength(100);
-            e.Property(x => x.CreatedAt).HasDefaultValueSql("(getdate())");
+            // FIX: was "(getdate())" — DB uses sysutcdatetime()
+            e.Property(x => x.CreatedAt).HasDefaultValueSql("(sysutcdatetime())");
             e.HasOne(x => x.Payment).WithMany(x => x.Refunds)
              .HasForeignKey(x => x.PaymentId).OnDelete(DeleteBehavior.ClientSetNull)
              .HasConstraintName("FK_Refunds_Payment");
@@ -340,14 +356,16 @@ public partial class TRSDbContext : DbContext
 
         // WebhookLogs
         mb.Entity<WebhookLog>(e => {
-            e.HasKey(x => x.WebhookLogId).HasName("PK__WebhookL__4DD95F127BA688F7");
+            // FIX: was stale auto-generated name "PK__WebhookL__4DD95F127BA688F7"
+            e.HasKey(x => x.WebhookLogId).HasName("PK_WebhookLogs");
             e.Property(x => x.WebhookLogId).HasColumnName("WebhookLogID");
             e.Property(x => x.PaymentGateway).HasMaxLength(20).IsUnicode(false);
             e.Property(x => x.GatewayEventId).HasMaxLength(255).IsUnicode(false).HasColumnName("GatewayEventID");
             e.Property(x => x.EventType).HasMaxLength(100).IsUnicode(false);
             e.Property(x => x.PayloadJson).HasColumnName("PayloadJSON");
             e.Property(x => x.ProcessingStatus).HasMaxLength(1).IsUnicode(false).IsFixedLength().HasDefaultValue("P");
-            e.Property(x => x.ReceivedAt).HasDefaultValueSql("(getdate())");
+            // FIX: was "(getdate())" — DB uses sysutcdatetime()
+            e.Property(x => x.ReceivedAt).HasDefaultValueSql("(sysutcdatetime())");
             e.Property(x => x.PaymentId).HasColumnName("PaymentID");
             e.HasIndex(x => x.GatewayEventId).IsUnique().HasDatabaseName("UQ_WebhookLogs_GatewayEventID");
             e.HasOne<Payment>().WithMany()
@@ -358,7 +376,8 @@ public partial class TRSDbContext : DbContext
         // BackgroundJobs
         mb.Entity<BackgroundJob>(e => {
             e.ToTable("BackgroundJobs");
-            e.HasKey(x => x.JobId).HasName("PK__Backgrou__056690C218EA13AF");
+            // FIX: was stale auto-generated name "PK__Backgrou__056690C218EA13AF"
+            e.HasKey(x => x.JobId).HasName("PK_BackgroundJobs");
             e.Property(x => x.JobId).HasColumnName("JobID");
             e.Property(x => x.ReferenceId).HasColumnName("ReferenceID");
             e.Property(x => x.JobType).HasMaxLength(100);

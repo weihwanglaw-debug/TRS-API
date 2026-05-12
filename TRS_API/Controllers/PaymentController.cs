@@ -184,10 +184,11 @@ namespace TRS_API.Controllers
 
             // PayNow sessions expire after 30 minutes, so rotate the idempotency key on the
             // same cadence to avoid Stripe returning an expired checkout session on retry.
-            var idempotencyKey = isPayNow
-                ? $"sf_{payload.EventId}_{payload.ContactEmail}_{(int)(totalAmount * 100)}_{method}_{DateTimeOffset.UtcNow.ToUnixTimeSeconds() / 1800}"
-                : $"sf_{payload.EventId}_{payload.ContactEmail}_{(int)(totalAmount * 100)}_{method}";
+      
+            var idempotencyKey = $"sf_{payload.EventId}_{method}_{payload.ContactEmail}_{(int)(totalAmount * 100)}_{DateTimeOffset.UtcNow.ToUnixTimeSeconds() / 600}";
             var requestOptions = new RequestOptions { IdempotencyKey = idempotencyKey };
+
+
 
             var session = await new SessionService().CreateAsync(options, requestOptions);
 
@@ -477,20 +478,25 @@ namespace TRS_API.Controllers
                             return BadRequest(new { message = $"'{gDto.ProgramName}' is full. No slots remaining." });
                         }
 
+                                        // Duplicate check (participant identity)
                         var incomingParticipants = gDto.Participants
                             .Select(p => new
                             {
                                 p.FullName,
                                 Dob = string.IsNullOrWhiteSpace(p.Dob) ? (DateOnly?)null : DateOnly.Parse(p.Dob),
-                            })
-                            .ToList();
+                            }).ToList();
 
-                        var isDuplicate = await _db.ParticipantGroups
-                            .AnyAsync(g => g.ProgramId == gDto.ProgramId
-                                && g.GroupStatus != "Cancelled"
-                                && g.Participants.Any(existing => incomingParticipants.Any(incoming =>
-                                    incoming.FullName == existing.FullName
-                                    && incoming.Dob == existing.DateOfBirth)));
+                            var existingParticipants = await _db.ParticipantGroups
+                                .Where(g => g.ProgramId == gDto.ProgramId && g.GroupStatus != "Cancelled")
+                                .SelectMany(g => g.Participants)
+                                .Select(p => new { p.FullName, p.DateOfBirth })
+                                .ToListAsync();
+
+                            var isDuplicate = incomingParticipants.Any(incoming =>
+                                existingParticipants.Any(existing =>
+                                    existing.FullName == incoming.FullName
+                                    && existing.DateOfBirth == incoming.Dob));
+
 
                         if (isDuplicate)
                         {
