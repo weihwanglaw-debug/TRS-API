@@ -170,6 +170,10 @@ public class InitiateRefundRequest
     [Required, Range(0.01, double.MaxValue)] public decimal RefundAmount { get; set; }
     public string? RefundReason { get; set; }
 }
+public class CancelRegistrationRequest
+{
+    [Required] public string Reason { get; set; } = null!;
+}
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 public class SaveFixtureRequest
@@ -275,4 +279,46 @@ public class AdvanceHeatsRoundRequest
 public class AssignHeatPlacesRequest
 {
     public Dictionary<string, int> Places { get; set; } = new();
+}
+// ── Participant update ────────────────────────────────────────────────────────
+public class UpdateParticipantRequest
+{
+    public string? FullName          { get; set; }
+    public string? Dob               { get; set; }   // "YYYY-MM-DD"
+    public string? Gender            { get; set; }
+    public string? Nationality       { get; set; }
+    public string? ClubSchoolCompany { get; set; }
+    public string? Email             { get; set; }
+    public string? ContactNumber     { get; set; }
+    public string? TshirtSize        { get; set; }
+    public string? SbaId             { get; set; }
+    public string? GuardianName      { get; set; }
+    public string? GuardianContact   { get; set; }
+    public string? Remark            { get; set; }
+    // Custom field values keyed by label (same shape as create)
+    public Dictionary<string, string>? CustomFieldValues { get; set; }
+}
+
+// ── Extended manual payment confirm ──────────────────────────────────────────
+// Replaces UpdatePaymentManualRequest — adds Waived / PendingCollection statuses
+// and an explicit AdminNote field now stored in its own DB column.
+public class ConfirmRegistrationRequest
+{
+    /// <summary>
+    /// S  = Paid (manual confirmation)
+    /// W  = Waived (fee waived by admin)
+    /// PC = Pending Collection (will pay on the day)
+    /// </summary>
+    [Required]
+    public string PaymentStatus { get; set; } = null!;
+
+    /// <summary>Method used / expected: Cash, BankTransfer, PayNow, Others, Waived</summary>
+    public string? Method { get; set; }
+
+    /// <summary>Optional reference e.g. PayNow txn ref, cash receipt number</summary>
+    public string? PaymentReference { get; set; }
+
+    /// <summary>Mandatory admin remark explaining the confirmation</summary>
+    [Required, MinLength(3)]
+    public string AdminNote { get; set; } = null!;
 }

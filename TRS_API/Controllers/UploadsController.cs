@@ -1,10 +1,8 @@
-using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 
 namespace TRS_API.Controllers;
 
 [ApiController, Route("api/uploads")]
-[Authorize(Roles = "superadmin,eventadmin")]
 public class UploadsController : ControllerBase
 {
     private readonly IWebHostEnvironment _env;

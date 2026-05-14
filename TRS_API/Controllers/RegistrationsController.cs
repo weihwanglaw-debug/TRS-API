@@ -17,6 +17,8 @@ public class RegistrationsController : ControllerBase
         "Pending",
         "Confirmed",
         "Cancelled",
+        "CancelPending",
+        "RefundFailed",
     };
 
     private readonly TRSDbContext _db;
@@ -24,15 +26,18 @@ public class RegistrationsController : ControllerBase
     private readonly IBackgroundJobQueue _jobQueue;
     private readonly ReceiptService _receipt;
     private readonly IServiceScopeFactory _serviceScopeFactory;
+    private readonly RegistrationWorkflowService _registrationWorkflow;
     public RegistrationsController(
         TRSDbContext db,
         ILogger<RegistrationsController> log,
         ReceiptService receipt,
         IBackgroundJobQueue jobQueue,
-        IServiceScopeFactory serviceScopeFactory)
-        => (_db, _log, _receipt, _jobQueue, _serviceScopeFactory) = (db, log, receipt, jobQueue, serviceScopeFactory);
+        IServiceScopeFactory serviceScopeFactory,
+        RegistrationWorkflowService registrationWorkflow)
+        => (_db, _log, _receipt, _jobQueue, _serviceScopeFactory, _registrationWorkflow) =
+            (db, log, receipt, jobQueue, serviceScopeFactory, registrationWorkflow);
 
-    // ── GET /api/registrations  ── admin, paged + filtered ─────────────────
+    // â”€â”€ GET /api/registrations  â”€â”€ admin, paged + filtered â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     [HttpGet, Authorize(Roles = "superadmin,eventadmin")]
     public async Task<IActionResult> GetAll(
         [FromQuery] int? eventId, [FromQuery] int? programId,
@@ -49,7 +54,7 @@ public class RegistrationsController : ControllerBase
         if (programId.HasValue) q = q.Where(r => r.ParticipantGroups.Any(g => g.ProgramId == programId));
         if (!string.IsNullOrEmpty(regStatus)) q = q.Where(r => r.RegStatus == regStatus);
         if (!string.IsNullOrEmpty(payStatus))
-            // Translate long-form frontend code ("Success") → DB short code ("S") before filtering
+            // Translate long-form frontend code ("Success") â†’ DB short code ("S") before filtering
             q = q.Where(r => r.Payments.Any(p => p.PaymentStatus == PayStatusToDb(payStatus)));
         if (!string.IsNullOrEmpty(search))
             q = q.Where(r => r.ContactName.Contains(search) || r.ContactEmail.Contains(search)
@@ -69,7 +74,7 @@ public class RegistrationsController : ControllerBase
         });
     }
 
-    // ── GET /api/registrations/:id  ── public (for PaymentResult receipt) ──
+    // â”€â”€ GET /api/registrations/:id  â”€â”€ public (for PaymentResult receipt) â”€â”€
     [HttpGet("{id:int}")]
     public async Task<IActionResult> GetById(int id)
     {
@@ -78,298 +83,44 @@ public class RegistrationsController : ControllerBase
         return Ok(MapReg(reg));
     }
 
-    // ── POST /api/registrations  ── public ─────────────────────────────────
+    // â”€â”€ POST /api/registrations  â”€â”€ public â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     [EnableRateLimiting("payment")]
     [HttpPost]
     public async Task<IActionResult> Create([FromBody] CreateRegistrationRequest req)
     {
-        using var tx = await _db.Database.BeginTransactionAsync();
-        try
+        var pricing = await _registrationWorkflow.ValidateAndPriceAsync(req);
+        if (!pricing.Success)
+            return BadRequest(new { code = pricing.Code, message = pricing.Message });
+
+        var paymentStatus = pricing.Value!.TotalAmount == 0 ? "S" : "P";
+        var createResult = await _registrationWorkflow.CreateAsync(req, new RegistrationPersistOptions
         {
-            // Pre-load custom fields for all programs in this registration so we can
-            // resolve label → CustomFieldId without N+1 queries inside the loop.
-            var programIds = req.Groups.Select(g => g.ProgramId).Distinct().ToList();
-            var customFieldsByProgram = await _db.ProgramCustomFields
-                .Where(cf => programIds.Contains(cf.ProgramId))
-                .GroupBy(cf => cf.ProgramId)
-                .ToDictionaryAsync(
-                    g => g.Key,
-                    g => g.ToDictionary(cf => cf.Label, cf => cf.CustomFieldId));
+            RequireEventOpen = true,
+            ValidatePricingAgainstCurrentPrograms = true,
+            PaymentGateway = req.Payment.Gateway,
+            PaymentMethod = req.Payment.Method,
+            PaymentStatus = paymentStatus,
+        });
 
-            var reg = new EventRegistration
-            {
-                EventId = req.EventId,
-                EventName = req.EventName,
-                RegStatus = "Pending",
-                ContactName = req.ContactName,
-                ContactEmail = req.ContactEmail,
-                ContactPhone = req.ContactPhone,
-                SubmittedAt = DateTime.UtcNow,
-                CreatedAt = DateTime.UtcNow,
-                // legacy fields
-                TotalAmount = req.Payment.Amount,
-                Currency = req.Payment.Currency,
-                RegistrationStatus = "P",
-            };
-            _db.EventRegistrations.Add(reg);
-            await _db.SaveChangesAsync();   // get RegistrationId
-
-            var groups = new List<ParticipantGroup>();
-            var allItems = new List<PaymentItem>();
-
-            for (int gi = 0; gi < req.Groups.Count; gi++)
-            {
-                var gDto = req.Groups[gi];
-
-                // ── Capacity check (race-condition safe) ──────────────────────
-                var program = await _db.Programs
-                    .FromSqlRaw(
-                        "SELECT * FROM Programs WITH (UPDLOCK, ROWLOCK) WHERE ProgramID = {0}",
-                        gDto.ProgramId)
-                    .FirstOrDefaultAsync();
-
-                if (program == null)
-                {
-                    await tx.RollbackAsync();
-                    return NotFound(new
-                    {
-                        code = "PROGRAM_NOT_FOUND",
-                        message = $"Program '{gDto.ProgramName}' not found."
-                    });
-                }
-
-                if (!program.IsActive || program.Status == "closed")
-                {
-                    await tx.RollbackAsync();
-                    return BadRequest(new
-                    {
-                        code = "PROGRAM_CLOSED",
-                        message = $"'{gDto.ProgramName}' is no longer accepting registrations."
-                    });
-                }
-
-                var activeGroupCount = await _db.ParticipantGroups
-                    .CountAsync(g => g.ProgramId == gDto.ProgramId
-                        && g.GroupStatus != "Cancelled");
-
-                if (activeGroupCount >= program.MaxParticipants)
-                {
-                    await tx.RollbackAsync();
-                    return BadRequest(new
-                    {
-                        code = "PROGRAM_FULL",
-                        message = $"'{gDto.ProgramName}' is full. No slots remaining."
-                    });
-                }
-
-                // ── Duplicate check (participant identity: name + DOB) ────────
-                // Matches on the actual participants being registered, not the
-                // contact email — this allows a parent to register two different
-                // children in the same program under their own email address.
-                                // Duplicate check (participant identity)
-                var incomingParticipants = gDto.Participants
-                    .Select(p => new
-                    {
-                        p.FullName,
-                        Dob = string.IsNullOrWhiteSpace(p.Dob) ? (DateOnly?)null : DateOnly.Parse(p.Dob),
-                    }).ToList();
-
-                    var existingParticipants = await _db.ParticipantGroups
-                        .Where(g => g.ProgramId == gDto.ProgramId && g.GroupStatus != "Cancelled")
-                        .SelectMany(g => g.Participants)
-                        .Select(p => new { p.FullName, p.DateOfBirth })
-                        .ToListAsync();
-
-                    var isDuplicate = incomingParticipants.Any(incoming =>
-                        existingParticipants.Any(existing =>
-                            existing.FullName == incoming.FullName
-                            && existing.DateOfBirth == incoming.Dob));
-
-
-                if (isDuplicate)
-                {
-                    await tx.RollbackAsync();
-                    return BadRequest(new
-                    {
-                        code = "DUPLICATE_REGISTRATION",
-                        message = $"One or more participants are already registered for '{gDto.ProgramName}'."
-                    });
-                }
-
-                var group = new ParticipantGroup
-                {
-                    RegistrationId = reg.RegistrationId,
-                    EventId = req.EventId,
-                    ProgramId = gDto.ProgramId,
-                    ProgramName = gDto.ProgramName,
-                    Fee = gDto.Fee,
-                    GroupStatus = "Pending",
-                    CreatedAt = DateTime.UtcNow,
-                };
-                _db.ParticipantGroups.Add(group);
-                await _db.SaveChangesAsync();   // get GroupId
-
-                var parts = new List<Participant>();
-                foreach (var pDto in gDto.Participants)
-                {
-                    var p = new Participant
-                    {
-                        GroupId = group.GroupId,
-                        FullName = pDto.FullName,
-                        DateOfBirth = pDto.Dob != null ? DateOnly.Parse(pDto.Dob) : null,
-                        Gender = pDto.Gender,
-                        Nationality = pDto.Nationality,
-                        ClubSchoolCompany = pDto.ClubSchoolCompany,
-                        Email = pDto.Email,
-                        ContactNumber = pDto.ContactNumber,
-                        TshirtSize = pDto.TshirtSize,
-                        SbaId = pDto.SbaId,
-                        GuardianName = pDto.GuardianName,
-                        GuardianContact = pDto.GuardianContact,
-                        DocumentUrl = pDto.DocumentUrl,
-                        Remark = pDto.Remark,
-                        CreatedAt = DateTime.UtcNow,
-                    };
-                    _db.Participants.Add(p);
-                    parts.Add(p);
-                }
-                await _db.SaveChangesAsync();   // get ParticipantIds
-
-                // ── Custom field values ───────────────────────────────────────
-                // Frontend sends { "Field Label": "value" } — resolve label → CustomFieldId
-                // using the pre-loaded lookup dict. FK requires a valid CustomFieldId.
-                var cfLookup = customFieldsByProgram.GetValueOrDefault(gDto.ProgramId)
-                               ?? new Dictionary<string, int>();
-
-                for (int pi = 0; pi < gDto.Participants.Count; pi++)
-                {
-                    foreach (var (label, val) in gDto.Participants[pi].CustomFieldValues)
-                    {
-                        if (!cfLookup.TryGetValue(label, out var cfId))
-                        {
-                            _log.LogWarning(
-                                "Custom field label '{Label}' not found for program {ProgramId} — skipping",
-                                label, gDto.ProgramId);
-                            continue;   // skip unknown labels rather than saving orphaned rows
-                        }
-                        _db.ParticipantCustomFieldValues.Add(new ParticipantCustomFieldValue
-                        {
-                            ParticipantId = parts[pi].ParticipantId,
-                            CustomFieldId = cfId,
-                            FieldLabel    = label,
-                            FieldValue    = val,
-                        });
-                    }
-                }
-
-                // display fields
-                group.ClubDisplay = parts.FirstOrDefault()?.ClubSchoolCompany ?? "";
-                group.NamesDisplay = string.Join(" / ", parts.Select(p => p.FullName));
-
-                // payment items for this group
-                foreach (var iDto in gDto.Items)
-                {
-                    int? participantId = null;
-                    if (iDto.ParticipantIndex.HasValue && iDto.ParticipantIndex < parts.Count)
-                        participantId = parts[iDto.ParticipantIndex.Value].ParticipantId;
-
-                    allItems.Add(new PaymentItem
-                    {
-                        GroupId = group.GroupId,
-                        EventId = req.EventId,
-                        ProgramId = gDto.ProgramId,
-                        ProgramName = iDto.ProgramName,
-                        Description = iDto.Description,
-                        PlayerName = iDto.PlayerName,
-                        Amount = iDto.Amount,
-                        ItemStatus = "P",
-                        CreatedAt = DateTime.UtcNow,
-                        ParticipantId = participantId,
-                    });
-                }
-                groups.Add(group);
-            }
-
-            var isFreeRegistration = reg.TotalAmount == 0;
-            var receiptNo = isFreeRegistration
-                ? $"TRS-{DateTime.UtcNow:yyyyMMdd}-{Random.Shared.Next(10000, 99999):D5}"
-                : null;
-
-            // Payment record
-            var payment = new Payment
-            {
-                RegistrationId = reg.RegistrationId,
-                EventId = req.EventId,
-                PaymentGateway = req.Payment.Gateway,
-                PaymentMethod = req.Payment.Method,
-                Amount = req.Payment.Amount,
-                Currency = req.Payment.Currency,
-                PaymentStatus = isFreeRegistration ? "S" : "P",
-                CreatedAt = DateTime.UtcNow,
-                PaidAt = isFreeRegistration ? DateTime.UtcNow : null,
-                ReceiptNumber = receiptNo,
-            };
-            _db.Payments.Add(payment);
-            await _db.SaveChangesAsync();
-
-            foreach (var item in allItems)
-            {
-                item.PaymentId = payment.PaymentId;
-                if (isFreeRegistration) item.ItemStatus = "S";
-                _db.PaymentItems.Add(item);
-            }
-
-            if (isFreeRegistration)
-            {
-                reg.RegStatus = "Confirmed";
-                reg.RegistrationStatus = "C";
-                reg.ConfirmedAt = DateTime.UtcNow;
-                foreach (var group in groups) group.GroupStatus = "Confirmed";
-            }
-
-            await _db.SaveChangesAsync();
-            await tx.CommitAsync();
-
-            if (isFreeRegistration)
-            {
-                var regIdForJob = reg.RegistrationId;
-                var payIdForJob = payment.PaymentId;
-                await _jobQueue.EnqueueAsync(async ct =>
-                {
-                    using var scope = _serviceScopeFactory.CreateScope();
-                    var receiptSvc = scope.ServiceProvider.GetRequiredService<ReceiptService>();
-                    var emailSvc = scope.ServiceProvider.GetRequiredService<EmailService>();
-                    var jobDb = scope.ServiceProvider.GetRequiredService<TRSDbContext>();
-                    try
-                    {
-                        var pdfBytes = await receiptSvc.GenerateAsync(jobDb, regIdForJob);
-                        await emailSvc.SendPaymentConfirmationAsync(jobDb, regIdForJob, pdfBytes, ct);
-                        _log.LogInformation("Receipt generated for free registration {RegId}", regIdForJob);
-                    }
-                    catch (Exception ex)
-                    {
-                        _log.LogError(ex, "Failed to generate receipt for free registration payment {PaymentId}", payIdForJob);
-                    }
-                });
-            }
-
-            var created = await LoadReg(reg.RegistrationId);
-            return Ok(MapReg(created!));
-        }
-        catch (Exception ex)
+        if (!createResult.Success)
         {
-            await tx.RollbackAsync();
-            _log.LogError(ex, "Error creating registration");
-            return StatusCode(500, new { code = "CREATE_FAILED", message = "Failed to create registration." });
+            var isNotFound = string.Equals(createResult.Code, "EVENT_NOT_FOUND", StringComparison.Ordinal)
+                || string.Equals(createResult.Code, "PROGRAM_NOT_FOUND", StringComparison.Ordinal);
+            return isNotFound
+                ? NotFound(new { code = createResult.Code, message = createResult.Message })
+                : BadRequest(new { code = createResult.Code, message = createResult.Message });
         }
+
+        var createdReg = await LoadReg(createResult.Value!.RegistrationId);
+        return Ok(MapReg(createdReg!));
     }
 
-    // ── PATCH /api/registrations/:id/status  ── admin ──────────────────────
+    // â”€â”€ PATCH /api/registrations/:id/status  â”€â”€ admin â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     [HttpPatch("{id:int}/status"), Authorize(Roles = "superadmin,eventadmin")]
     public async Task<IActionResult> UpdateStatus(int id, [FromBody] UpdateRegStatusRequest req)
     {
         if (!AllowedStatuses.Contains(req.Status))
-            return BadRequest(new { code = "INVALID_STATUS", message = "Status must be Pending, Confirmed, or Cancelled." });
+            return BadRequest(new { code = "INVALID_STATUS", message = "Status must be Pending, Confirmed, CancelPending, RefundFailed, or Cancelled." });
 
         var reg = await _db.EventRegistrations.FindAsync(id);
         if (reg == null) return NotFound(new { code = "NOT_FOUND", message = "Registration not found." });
@@ -395,12 +146,12 @@ public class RegistrationsController : ControllerBase
         return Ok(MapReg(updated!));
     }
 
-    // ── PATCH /api/registrations/:id/groups/:gid/status  ── admin ──────────
+    // â”€â”€ PATCH /api/registrations/:id/groups/:gid/status  â”€â”€ admin â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     [HttpPatch("{id:int}/groups/{gid:int}/status"), Authorize(Roles = "superadmin,eventadmin")]
     public async Task<IActionResult> UpdateGroupStatus(int id, int gid, [FromBody] UpdateRegStatusRequest req)
     {
         if (!AllowedStatuses.Contains(req.Status))
-            return BadRequest(new { code = "INVALID_STATUS", message = "Status must be Pending, Confirmed, or Cancelled." });
+            return BadRequest(new { code = "INVALID_STATUS", message = "Status must be Pending, Confirmed, CancelPending, RefundFailed, or Cancelled." });
 
         var group = await _db.ParticipantGroups
             .FirstOrDefaultAsync(g => g.GroupId == gid && g.RegistrationId == id);
@@ -411,7 +162,7 @@ public class RegistrationsController : ControllerBase
         return Ok(MapReg(updated!));
     }
 
-    // ── PATCH /api/registrations/:id/groups/:gid/seed  ── admin ─────────────
+    // â”€â”€ PATCH /api/registrations/:id/groups/:gid/seed  â”€â”€ admin â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     [HttpPatch("{id:int}/groups/{gid:int}/seed"), Authorize(Roles = "superadmin,eventadmin")]
     public async Task<IActionResult> UpdateGroupSeed(int id, int gid, [FromBody] UpdateSeedRequest req)
     {
@@ -424,7 +175,7 @@ public class RegistrationsController : ControllerBase
         return Ok(MapReg(updated!));
     }
 
-    // ── GET /api/registrations/:id/payment  ── admin ───────────────────────
+    // â”€â”€ GET /api/registrations/:id/payment  â”€â”€ admin â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     [HttpGet("{id:int}/payment"), Authorize(Roles = "superadmin,eventadmin")]
     public async Task<IActionResult> GetPayment(int id)
     {
@@ -434,7 +185,7 @@ public class RegistrationsController : ControllerBase
         return Ok(MapPayment(payment));
     }
 
-    // ── PATCH /api/registrations/:id/payment  ── admin (manual confirm) ────
+    // â”€â”€ PATCH /api/registrations/:id/payment  â”€â”€ admin (manual confirm) â”€â”€â”€â”€
     [HttpPatch("{id:int}/payment"), Authorize(Roles = "superadmin,eventadmin")]
     public async Task<IActionResult> UpdatePayment(int id, [FromBody] UpdatePaymentManualRequest req)
     {
@@ -444,14 +195,14 @@ public class RegistrationsController : ControllerBase
 
         if (req.Method != null) payment.PaymentMethod = req.Method;
 
-        // Translate long-form frontend status ("Success") → DB short code ("S")
+        // Translate long-form frontend status ("Success") â†’ DB short code ("S")
         // This also prevents truncation errors on the VARCHAR(2) column.
         if (req.PaymentStatus != null)
             payment.PaymentStatus = PayStatusToDb(req.PaymentStatus);
 
         if (req.ReceiptNo != null) payment.ReceiptNumber = req.ReceiptNo;
 
-        // payment.PaymentStatus is now always a short code — safe to compare with "S"
+        // payment.PaymentStatus is now always a short code â€” safe to compare with "S"
         if (payment.PaymentStatus == "S")
         {
             payment.PaidAt = DateTime.UtcNow;
@@ -487,7 +238,7 @@ public class RegistrationsController : ControllerBase
         return Ok(MapReg(updated!));
     }
 
-    // ── GET /api/registrations/:id/payment/refunds  ── admin ───────────────
+    // â”€â”€ GET /api/registrations/:id/payment/refunds  â”€â”€ admin â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     [HttpGet("{id:int}/payment/refunds"), Authorize(Roles = "superadmin,eventadmin")]
     public async Task<IActionResult> GetRefunds(int id)
     {
@@ -513,7 +264,7 @@ public class RegistrationsController : ControllerBase
         }));
     }
 
-    // ── POST /api/registrations/:id/payment/refunds  ── admin ──────────────
+    // â”€â”€ POST /api/registrations/:id/payment/refunds  â”€â”€ admin â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     [HttpPost("{id:int}/payment/refunds"), Authorize(Roles = "superadmin,eventadmin")]
     public async Task<IActionResult> InitiateRefund(int id, [FromBody] InitiateRefundRequest req)
     {
@@ -523,81 +274,11 @@ public class RegistrationsController : ControllerBase
 
         var item = payment.Items.FirstOrDefault(i => i.PaymentItemId == req.PaymentItemId);
         if (item == null) return NotFound(new { code = "NOT_FOUND", message = "Payment item not found." });
-        if (item.ItemStatus != "S")
-            return BadRequest(new { code = "INVALID_STATE", message = "Only confirmed items can be refunded." });
-        if (await _db.Refunds.AnyAsync(r => r.PaymentItemId == req.PaymentItemId && r.RefundStatus == "P"))
-            return BadRequest(new { code = "REFUND_IN_PROGRESS", message = "A refund for this item is already in progress." });
-        if (req.RefundAmount > item.Amount)
-            return BadRequest(new { code = "OVER_REFUND", message = $"Maximum refundable is {item.Amount}." });
+        var result = await ProcessRefundItemAsync(id, payment, item, req.RefundAmount, req.RefundReason);
+        if (!result.Success)
+            return BadRequest(new { code = result.Code, message = result.Message });
 
-        var refund = new TRS_Data.Models.Refund
-        {
-            PaymentId = payment.PaymentId,
-            PaymentItemId = req.PaymentItemId,
-            PaymentGateway = payment.PaymentGateway,
-            RefundAmount = req.RefundAmount,
-            RefundReason = req.RefundReason,
-            RefundStatus = "P",
-            RequestedBy = User.Identity?.Name ?? "admin",
-            CreatedAt = DateTime.UtcNow,
-        };
-
-        try
-        {
-            if (payment.PaymentGateway == "Stripe")
-            {
-                var refundOptions = new RefundCreateOptions
-                {
-                    PaymentIntent = payment.GatewayPaymentId,
-                    Amount = (long)(req.RefundAmount * 100),
-                    Reason = "requested_by_customer",
-                    Metadata = new Dictionary<string, string>
-                    {
-                        ["registration_id"] = id.ToString(),
-                        ["payment_item_id"] = req.PaymentItemId.ToString(),
-                    }
-                };
-
-                var stripeRefund = await new RefundService().CreateAsync(refundOptions);
-                refund.GatewayRefundId = stripeRefund.Id;
-                refund.RefundStatus = stripeRefund.Status == "failed" ? "F" : "S";
-                refund.ProcessedAt = DateTime.UtcNow;
-            }
-            else
-            {
-                refund.RefundStatus = "S";
-                refund.ProcessedAt = DateTime.UtcNow;
-            }
-        }
-        catch (StripeException ex)
-        {
-            return BadRequest(new
-            {
-                code = ex.StripeError?.Code ?? "REFUND_FAILED",
-                message = ex.StripeError?.Message ?? "Refund failed."
-            });
-        }
-
-        _db.Refunds.Add(refund);
-
-        if (refund.RefundStatus == "S")
-        {
-            item.ItemStatus = "R";
-            item.UpdatedAt = DateTime.UtcNow;
-            PaymentController.ApplyRefundOutcome(payment);
-        }
-
-        _db.PaymentAuditLogs.Add(new PaymentAuditLog
-        {
-            EntityType = "Refund",
-            EntityId = 0,
-            Action = "RefundInitiated",
-            Reason = req.RefundReason,
-            PerformedBy = User.Identity?.Name ?? "admin",
-            Notes = $"PaymentItemId={req.PaymentItemId}, Amount={req.RefundAmount}",
-            CreatedAt = DateTime.UtcNow,
-        });
-        await _db.SaveChangesAsync();
+        var refund = result.Refund!;
         return Ok(new
         {
             id = refund.RefundId.ToString(),
@@ -607,7 +288,54 @@ public class RegistrationsController : ControllerBase
         });
     }
 
-    // ── GET /api/registrations/export  ── admin ─────────────────────────────
+    [HttpPost("{id:int}/cancel-with-refunds"), Authorize(Roles = "superadmin,eventadmin")]
+    public async Task<IActionResult> CancelWithRefunds(int id, [FromBody] CancelRegistrationRequest req)
+    {
+        if (string.IsNullOrWhiteSpace(req.Reason))
+            return BadRequest(new { code = "REASON_REQUIRED", message = "Cancellation reason is required." });
+
+        var reg = await _db.EventRegistrations
+            .Include(r => r.ParticipantGroups)
+            .FirstOrDefaultAsync(r => r.RegistrationId == id);
+        if (reg == null) return NotFound(new { code = "NOT_FOUND", message = "Registration not found." });
+
+        var payment = await _db.Payments.Include(p => p.Items)
+            .FirstOrDefaultAsync(p => p.RegistrationId == id);
+
+        if (payment == null || payment.Items.All(i => i.ItemStatus != "S"))
+        {
+            ApplyRegistrationStatus(reg, "Cancelled");
+            await _db.SaveChangesAsync();
+            var cancelled = await LoadReg(id);
+            return Ok(new { registration = MapReg(cancelled!), errors = Array.Empty<string>() });
+        }
+
+        ApplyRegistrationStatus(reg, "CancelPending");
+        await _db.SaveChangesAsync();
+
+        var errors = new List<string>();
+        foreach (var item in payment.Items.Where(i => i.ItemStatus == "S").ToList())
+        {
+            var refund = await ProcessRefundItemAsync(
+                id,
+                payment,
+                item,
+                item.Amount,
+                $"Cancelled: {req.Reason}");
+
+            if (!refund.Success)
+                errors.Add($"{item.ProgramName}: {refund.Message}");
+        }
+
+        var hasRemainingRefundableItems = payment.Items.Any(i => i.ItemStatus == "S");
+        ApplyRegistrationStatus(reg, errors.Count == 0 && !hasRemainingRefundableItems ? "Cancelled" : "RefundFailed");
+        await _db.SaveChangesAsync();
+
+        var updated = await LoadReg(id);
+        return Ok(new { registration = MapReg(updated!), errors });
+    }
+
+    // â”€â”€ GET /api/registrations/export  â”€â”€ admin â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     [HttpGet("export"), Authorize(Roles = "superadmin,eventadmin")]
     public async Task<IActionResult> Export([FromQuery] int? eventId, [FromQuery] int? programId)
     {
@@ -621,7 +349,7 @@ public class RegistrationsController : ControllerBase
         return Ok(items.Select(MapReg));
     }
 
-    // ── GET /api/registrations/stats  ── admin ──────────────────────────────
+    // â”€â”€ GET /api/registrations/stats  â”€â”€ admin â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     [HttpGet("stats"), Authorize(Roles = "superadmin,eventadmin")]
     public async Task<IActionResult> Stats([FromQuery] int? eventId)
     {
@@ -640,7 +368,7 @@ public class RegistrationsController : ControllerBase
         });
     }
 
-    // ── GET /api/registrations/:id/receipt  ── public ─────────────────────────
+    // â”€â”€ GET /api/registrations/:id/receipt  â”€â”€ public â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     [HttpGet("{id:int}/receipt")]
     public async Task<IActionResult> GetReceipt(int id)
     {
@@ -664,7 +392,158 @@ public class RegistrationsController : ControllerBase
         }
     }
 
-    // ── Load helper ──────────────────────────────────────────────────────────
+
+    // â”€â”€ PATCH /api/registrations/:id/participants/:pid  â”€â”€ admin â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // Update individual participant details.
+    // TODO (future): write each changed field to ParticipantAuditLog with
+    //   OldValue, NewValue, ModifiedBy, ModifiedAt for full change history.
+    [HttpPatch("{id:int}/participants/{pid:int}"), Authorize(Roles = "superadmin,eventadmin")]
+    public async Task<IActionResult> UpdateParticipant(int id, int pid, [FromBody] UpdateParticipantRequest req)
+    {
+        // Verify the participant belongs to this registration
+        var participant = await _db.Participants
+            .Include(p => p.Group)
+            .Include(p => p.CustomFieldValues)
+            .FirstOrDefaultAsync(p => p.ParticipantId == pid && p.Group.RegistrationId == id);
+
+        if (participant == null)
+            return NotFound(new { code = "NOT_FOUND", message = "Participant not found in this registration." });
+
+        // Capture old values for audit (TODO: write to ParticipantAuditLog)
+        // var oldValues = new { participant.FullName, participant.DateOfBirth, ... };
+
+        if (req.FullName          != null) participant.FullName          = req.FullName;
+        if (req.Gender            != null) participant.Gender            = req.Gender;
+        if (req.Nationality       != null) participant.Nationality       = req.Nationality;
+        if (req.ClubSchoolCompany != null) participant.ClubSchoolCompany = req.ClubSchoolCompany;
+        if (req.Email             != null) participant.Email             = req.Email;
+        if (req.ContactNumber     != null) participant.ContactNumber     = req.ContactNumber;
+        if (req.TshirtSize        != null) participant.TshirtSize        = req.TshirtSize;
+        if (req.SbaId             != null) participant.SbaId             = req.SbaId;
+        if (req.GuardianName      != null) participant.GuardianName      = req.GuardianName;
+        if (req.GuardianContact   != null) participant.GuardianContact   = req.GuardianContact;
+        if (req.Remark            != null) participant.Remark            = req.Remark;
+
+        if (req.Dob != null)
+            participant.DateOfBirth = string.IsNullOrWhiteSpace(req.Dob)
+                ? null
+                : DateOnly.Parse(req.Dob);
+
+        // Update custom field values (upsert by label)
+        if (req.CustomFieldValues != null)
+        {
+            foreach (var (label, value) in req.CustomFieldValues)
+            {
+                var existing = participant.CustomFieldValues
+                    .FirstOrDefault(cf => cf.FieldLabel == label);
+                if (existing != null)
+                    existing.FieldValue = value;
+                // Note: we don't add new custom fields here â€” only update existing ones.
+                // New custom fields are defined at program level.
+            }
+        }
+
+        participant.UpdatedAt = DateTime.UtcNow;
+
+        // TODO: write ParticipantAuditLog entries here (one per changed field)
+        // _db.ParticipantAuditLogs.Add(new ParticipantAuditLog { ... });
+
+        await _db.SaveChangesAsync();
+
+        var updated = await LoadReg(id);
+        return Ok(MapReg(updated!));
+    }
+
+    // â”€â”€ POST /api/registrations/:id/confirm  â”€â”€ admin â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // Admin confirms a registration directly â€” bypasses online payment.
+    // Supports three payment outcomes:
+    //   S  = Paid (manual confirmation â€” cash/bank/PayNow collected)
+    //   W  = Waived (admin waives the fee entirely â€” VIP, staff, error correction)
+    //   PC = Pending Collection (registration confirmed, payment to be collected later)
+    [HttpPost("{id:int}/confirm"), Authorize(Roles = "superadmin,eventadmin")]
+    public async Task<IActionResult> ConfirmRegistration(int id, [FromBody] ConfirmRegistrationRequest req)
+    {
+        var allowedStatuses = new[] { "S", "W", "PC" };
+        var status = PayStatusToDb(req.PaymentStatus);
+        if (!allowedStatuses.Contains(status))
+            return BadRequest(new { code = "INVALID_STATUS", message = "PaymentStatus must be S (Paid), W (Waived), or PC (Pending Collection)." });
+
+        var reg = await LoadReg(id);
+        if (reg == null) return NotFound(new { code = "NOT_FOUND", message = "Registration not found." });
+
+        var payment = reg.Payments.FirstOrDefault();
+
+        if (payment == null)
+        {
+            // Create a manual payment record for free/waived registrations
+            payment = new Payment
+            {
+                RegistrationId = id,
+                EventId        = reg.EventId,
+                PaymentGateway = "Manual",
+                PaymentMethod  = req.Method ?? (status == "W" ? "Others" : "Cash"),
+                Amount         = reg.ParticipantGroups.Sum(g => g.Fee),
+                Currency       = "SGD",
+                PaymentStatus  = status,
+                AdminNote      = req.AdminNote,
+                CreatedAt      = DateTime.UtcNow,
+            };
+            _db.Payments.Add(payment);
+            await _db.SaveChangesAsync();
+        }
+        else
+        {
+            if (req.Method != null) payment.PaymentMethod = req.Method;
+            payment.PaymentStatus = status;
+            payment.AdminNote     = req.AdminNote;
+            if (req.PaymentReference != null) payment.ReceiptNumber = req.PaymentReference;
+            payment.UpdatedAt = DateTime.UtcNow;
+        }
+
+        // For Paid or Waived: stamp paidAt, generate receipt, flip items to S
+        if (status == "S" || status == "W")
+        {
+            payment.PaidAt = DateTime.UtcNow;
+            if (string.IsNullOrEmpty(payment.ReceiptNumber))
+            {
+                var d = DateTime.UtcNow;
+                payment.ReceiptNumber = $"TRS-{d:yyyyMMdd}-{Random.Shared.Next(10000, 99999)}";
+            }
+            foreach (var item in payment.Items) { item.ItemStatus = "S"; item.UpdatedAt = DateTime.UtcNow; }
+        }
+
+        // Confirm the registration regardless of payment status
+        reg.RegStatus         = "Confirmed";
+        reg.RegistrationStatus = "C";
+        reg.ConfirmedAt       = DateTime.UtcNow;
+        reg.UpdatedAt         = DateTime.UtcNow;
+
+        // Cascade status to all participant groups
+        foreach (var g in reg.ParticipantGroups)
+        {
+            g.GroupStatus = "Confirmed";
+            g.UpdatedAt   = DateTime.UtcNow;
+        }
+
+        _db.PaymentAuditLogs.Add(new PaymentAuditLog
+        {
+            EntityType  = "Payment",
+            EntityId    = payment.PaymentId,
+            Action      = $"AdminConfirm_{status}",
+            NewStatus   = status,
+            Reason      = req.AdminNote,
+            PerformedBy = User.Identity?.Name ?? "admin",
+            IpAddress   = HttpContext.Connection.RemoteIpAddress?.ToString(),
+            CreatedAt   = DateTime.UtcNow,
+        });
+
+        await _db.SaveChangesAsync();
+
+        var updated = await LoadReg(id);
+        return Ok(MapReg(updated!));
+    }
+
+    // â”€â”€ Load helper â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     private Task<EventRegistration?> LoadReg(int id) =>
         _db.EventRegistrations
             .Include(r => r.ParticipantGroups).ThenInclude(g => g.Participants)
@@ -672,22 +551,187 @@ public class RegistrationsController : ControllerBase
             .Include(r => r.Payments).ThenInclude(p => p.Items)
             .FirstOrDefaultAsync(r => r.RegistrationId == id);
 
-    // ── Status code translation helpers ──────────────────────────────────────
+    // â”€â”€ Status code translation helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // DB stores short codes; the frontend TypeScript types use long names.
     // All translation is centralised here so no other file needs to change.
 
+    private async Task<RefundOperationResult> ProcessRefundItemAsync(
+        int registrationId,
+        Payment payment,
+        PaymentItem item,
+        decimal refundAmount,
+        string? refundReason)
+    {
+        var successfulRefund = await _db.Refunds
+            .FirstOrDefaultAsync(r => r.PaymentItemId == item.PaymentItemId && r.RefundStatus == "S");
+        if (successfulRefund != null)
+        {
+            await ReconcileSuccessfulRefundAsync(payment, item, successfulRefund, refundReason);
+            return RefundOperationResult.Ok(successfulRefund);
+        }
+
+        if (item.ItemStatus != "S")
+            return RefundOperationResult.Fail("INVALID_STATE", "Only confirmed items can be refunded.");
+        if (refundAmount > item.Amount)
+            return RefundOperationResult.Fail("OVER_REFUND", $"Maximum refundable is {item.Amount}.");
+
+        var refund = await _db.Refunds
+            .FirstOrDefaultAsync(r => r.PaymentItemId == item.PaymentItemId && r.RefundStatus == "P");
+        if (refund != null)
+        {
+            if (!string.IsNullOrEmpty(refund.GatewayRefundId))
+                return RefundOperationResult.Fail("REFUND_IN_PROGRESS", "A refund for this item is already in progress.");
+            if (refund.RefundAmount != refundAmount)
+                return RefundOperationResult.Fail("REFUND_IN_PROGRESS", "A pending refund exists for this item with a different amount.");
+        }
+        else
+        {
+            refund = new TRS_Data.Models.Refund
+            {
+                PaymentId = payment.PaymentId,
+                PaymentItemId = item.PaymentItemId,
+                PaymentGateway = payment.PaymentGateway,
+                RefundAmount = refundAmount,
+                RefundReason = refundReason,
+                RefundStatus = "P",
+                RequestedBy = User.Identity?.Name ?? "admin",
+                CreatedAt = DateTime.UtcNow,
+            };
+            _db.Refunds.Add(refund);
+            await _db.SaveChangesAsync();
+        }
+
+        try
+        {
+            if (payment.PaymentGateway == "Stripe")
+            {
+                var stripeRefund = await new RefundService().CreateAsync(
+                    new RefundCreateOptions
+                    {
+                        PaymentIntent = payment.GatewayPaymentId,
+                        Amount = (long)(refundAmount * 100),
+                        Reason = "requested_by_customer",
+                        Metadata = new Dictionary<string, string>
+                        {
+                            ["registration_id"] = registrationId.ToString(),
+                            ["payment_item_id"] = item.PaymentItemId.ToString(),
+                        }
+                    },
+                    new RequestOptions { IdempotencyKey = $"trs_refund_{refund.RefundId}" });
+
+                refund.GatewayRefundId = stripeRefund.Id;
+                refund.RefundStatus = stripeRefund.Status == "failed" ? "F" : "S";
+                refund.ProcessedAt = DateTime.UtcNow;
+                await _db.SaveChangesAsync();
+            }
+            else
+            {
+                refund.RefundStatus = "S";
+                refund.ProcessedAt = DateTime.UtcNow;
+                await _db.SaveChangesAsync();
+            }
+        }
+        catch (StripeException ex)
+        {
+            refund.RefundStatus = "F";
+            refund.ProcessedAt = DateTime.UtcNow;
+            _db.PaymentAuditLogs.Add(new PaymentAuditLog
+            {
+                EntityType = "Refund",
+                EntityId = refund.RefundId,
+                Action = "RefundFailed",
+                Reason = refundReason,
+                PerformedBy = User.Identity?.Name ?? "admin",
+                Notes = ex.StripeError?.Message ?? ex.Message,
+                CreatedAt = DateTime.UtcNow,
+            });
+            await _db.SaveChangesAsync();
+            return RefundOperationResult.Fail(
+                ex.StripeError?.Code ?? "REFUND_FAILED",
+                ex.StripeError?.Message ?? "Refund failed.");
+        }
+
+        if (refund.RefundStatus != "S")
+            return RefundOperationResult.Fail("REFUND_FAILED", "Refund did not complete successfully.");
+
+        await ReconcileSuccessfulRefundAsync(payment, item, refund, refundReason);
+        return RefundOperationResult.Ok(refund);
+    }
+
+    private async Task ReconcileSuccessfulRefundAsync(
+        Payment payment,
+        PaymentItem item,
+        TRS_Data.Models.Refund refund,
+        string? refundReason)
+    {
+        if (item.ItemStatus != "R")
+        {
+            item.ItemStatus = "R";
+            item.UpdatedAt = DateTime.UtcNow;
+        }
+
+        PaymentController.ApplyRefundOutcome(payment);
+        _db.PaymentAuditLogs.Add(new PaymentAuditLog
+        {
+            EntityType = "Refund",
+            EntityId = refund.RefundId,
+            Action = "RefundInitiated",
+            Reason = refundReason,
+            PerformedBy = User.Identity?.Name ?? "admin",
+            Notes = $"PaymentItemId={item.PaymentItemId}, Amount={refund.RefundAmount}",
+            CreatedAt = DateTime.UtcNow,
+        });
+        await _db.SaveChangesAsync();
+    }
+
+    private static void ApplyRegistrationStatus(EventRegistration reg, string status)
+    {
+        reg.RegStatus = status;
+        reg.RegistrationStatus = status switch { "Confirmed" => "C", "Cancelled" => "X", _ => "P" };
+        if (status == "Confirmed") reg.ConfirmedAt = DateTime.UtcNow;
+        reg.UpdatedAt = DateTime.UtcNow;
+        foreach (var group in reg.ParticipantGroups)
+        {
+            group.GroupStatus = status;
+            group.UpdatedAt = DateTime.UtcNow;
+        }
+    }
+
+    private sealed class RefundOperationResult
+    {
+        public bool Success { get; private init; }
+        public string? Code { get; private init; }
+        public string? Message { get; private init; }
+        public TRS_Data.Models.Refund? Refund { get; private init; }
+
+        public static RefundOperationResult Ok(TRS_Data.Models.Refund refund) => new()
+        {
+            Success = true,
+            Refund = refund,
+        };
+
+        public static RefundOperationResult Fail(string code, string message) => new()
+        {
+            Success = false,
+            Code = code,
+            Message = message,
+        };
+    }
+
     private static string PayStatusToDb(string s) => s switch
     {
-        "Success"           => "S",
-        "Pending"           => "P",
-        "PartiallyRefunded" => "PR",
-        "FullyRefunded"     => "FR",
-        "Failed"            => "F",
-        "Cancelled"         => "X",
-        _                   => s    // already a short code — pass through
+        "Success"            => "S",
+        "Pending"            => "P",
+        "PartiallyRefunded"  => "PR",
+        "FullyRefunded"      => "FR",
+        "Failed"             => "F",
+        "Cancelled"          => "X",
+        "Waived"             => "W",
+        "PendingCollection"  => "PC",
+        _                    => s    // already a short code â€” pass through
     };
 
-    // ── Map helpers ──────────────────────────────────────────────────────────
+    // â”€â”€ Map helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     private static object MapPayment(Payment p) => new
     {
         id = p.PaymentId.ToString(),
@@ -704,6 +748,7 @@ public class RegistrationsController : ControllerBase
         gatewayChargeId = p.GatewayChargeId,
         createdAt = p.CreatedAt,
         paidAt = p.PaidAt,
+        adminNote = p.AdminNote,
         items = p.Items.Select(i => new {
             id = i.PaymentItemId.ToString(),
             paymentId = i.PaymentId.ToString(),

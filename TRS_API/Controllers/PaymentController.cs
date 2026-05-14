@@ -1,4 +1,4 @@
-﻿using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
 using System.Text.Json;
@@ -20,19 +20,25 @@ namespace TRS_API.Controllers
         private readonly TRSDbContext _db;
         private readonly IBackgroundJobQueue _jobQueue;
         private readonly IServiceScopeFactory _serviceScopeFactory;
+        private readonly RegistrationWorkflowService _registrationWorkflow;
+        private readonly PaymentFinalizationService _paymentFinalization;
 
         public PaymentController(
             ILogger<PaymentController> logger,
             IConfiguration config,
             TRSDbContext db,
             IBackgroundJobQueue jobQueue,
-            IServiceScopeFactory serviceScopeFactory)
+            IServiceScopeFactory serviceScopeFactory,
+            RegistrationWorkflowService registrationWorkflow,
+            PaymentFinalizationService paymentFinalization)
         {
             _logger = logger;
             _config = config;
             _db = db;
             _jobQueue = jobQueue;
             _serviceScopeFactory = serviceScopeFactory;
+            _registrationWorkflow = registrationWorkflow;
+            _paymentFinalization = paymentFinalization;
             StripeConfiguration.ApiKey = _config["Stripe:SecretKey"];
         }
 
@@ -125,7 +131,6 @@ namespace TRS_API.Controllers
 
         private async Task<IActionResult> CreateSessionFirstCheckout(PaymentRequest request)
         {
-            // Deserialize payload to compute amount server-side
             var payload = JsonSerializer.Deserialize<CreateRegistrationRequest>(
                 request.RegistrationPayload!.Value.GetRawText(),
                 new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
@@ -133,12 +138,19 @@ namespace TRS_API.Controllers
             if (payload == null)
                 return BadRequest(new { message = "Invalid registration payload" });
 
-            // Compute total from groups - never trust client-sent amount
-            var totalAmount = payload.Groups.Sum(g => g.Fee);
+            var pricing = await _registrationWorkflow.ValidateAndPriceAsync(payload, new RegistrationValidationOptions
+            {
+                RequireEventOpen = true,
+                ValidatePricingAgainstCurrentPrograms = true,
+            });
+            if (!pricing.Success)
+                return BadRequest(new { code = pricing.Code, message = pricing.Message });
+
+            var totalAmount = pricing.Value!.TotalAmount;
             if (totalAmount <= 0)
                 return BadRequest(new { message = "Total amount must be greater than zero" });
 
-            var currency = payload.Payment?.Currency ?? "SGD";
+            var currency = pricing.Value.Currency;
             var method = (request.PaymentMethod ?? "card").ToLower().Trim();
             var isPayNow = method == "paynow";
             var stripeMethod = isPayNow ? "paynow" : "card";
@@ -354,339 +366,40 @@ namespace TRS_API.Controllers
         [HttpPost("confirm-session")]
         public async Task<IActionResult> ConfirmSession([FromBody] ConfirmSessionRequest request)
         {
+            StripeConfiguration.ApiKey = _config["Stripe:SecretKey"];
+
+            var verifiedSessionService = new SessionService();
+            Session verifiedSession;
             try
             {
-                StripeConfiguration.ApiKey = _config["Stripe:SecretKey"];
-
-                // -- 1. Retrieve and verify session with Stripe -----------------
-                var sessionService = new SessionService();
-                Session session;
-                try
-                {
-                    session = await sessionService.GetAsync(request.GatewaySessionId);
-                }
-                catch (StripeException ex)
-                {
-                    _logger.LogWarning(ex, "Stripe session not found: {SessionId}", request.GatewaySessionId);
-                    return BadRequest(new { message = "Payment session not found. Please contact the organiser." });
-                }
-
-                if (session.PaymentStatus != "paid")
-                {
-                    _logger.LogWarning("Session {SessionId} not paid - status: {Status}",
-                        request.GatewaySessionId, session.PaymentStatus);
-                    return BadRequest(new { message = "Payment has not been confirmed by Stripe." });
-                }
-
-                // -- 2. Idempotency: check if already processed -----------------
-                var existing = await _db.Payments
-                    .Include(p => p.Registration)
-                    .FirstOrDefaultAsync(p => p.GatewaySessionId == request.GatewaySessionId
-                                           && p.PaymentStatus == "S");
-                if (existing != null)
-                {
-                    _logger.LogInformation("Session {SessionId} already confirmed -> reg {RegId}",
-                        request.GatewaySessionId, existing.RegistrationId);
-                    return Ok(new { registrationId = existing.RegistrationId.ToString() });
-                }
-
-                // -- 3. Deserialize registration payload ------------------------
-                var req = JsonSerializer.Deserialize<CreateRegistrationRequest>(
-                    request.RegistrationPayload.GetRawText(),
-                    new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
-
-                if (req == null)
-                    return BadRequest(new { message = "Invalid registration payload." });
-
-                // -- 4. Server-side amount verification -------------------------
-                var computedAmount = req.Groups.Sum(g => g.Fee);
-                var stripeAmount   = (session.AmountTotal ?? 0) / 100m;  // Stripe stores in cents; AmountTotal is long?
-                if (Math.Abs(computedAmount - stripeAmount) > 0.01m)
-                {
-                    _logger.LogWarning(
-                        "Amount mismatch for session {SessionId}: payload={Payload} stripe={Stripe}",
-                        request.GatewaySessionId, computedAmount, stripeAmount);
-                    // Log but don't block - Stripe amount is ground truth
-                }
-
-                // -- 5. Read payment method from Stripe metadata ----------------
-                session.Metadata.TryGetValue("payment_method", out var paymentMethod);
-                paymentMethod ??= "CreditCard";
-
-                // -- 6. Pre-load custom fields for label -> ID resolution ------------
-                var programIds = req.Groups.Select(g => g.ProgramId).Distinct().ToList();
-                var customFieldsByProgram = await _db.ProgramCustomFields
-                    .Where(cf => programIds.Contains(cf.ProgramId))
-                    .GroupBy(cf => cf.ProgramId)
-                    .ToDictionaryAsync(
-                        g => g.Key,
-                        g => g.ToDictionary(cf => cf.Label, cf => cf.CustomFieldId));
-
-                // -- 7. Write to DB in one transaction ------------------------------
-                using var tx = await _db.Database.BeginTransactionAsync();
-                try
-                {
-                    // Registration
-                    var reg = new EventRegistration
-                    {
-                        EventId            = req.EventId,
-                        EventName          = req.EventName,
-                        RegStatus          = "Confirmed",
-                        RegistrationStatus = "C",
-                        ContactName        = req.ContactName,
-                        ContactEmail       = req.ContactEmail,
-                        ContactPhone       = req.ContactPhone,
-                        TotalAmount        = stripeAmount,  // use Stripe-confirmed amount
-                        Currency           = req.Payment?.Currency ?? "SGD",
-                        SubmittedAt        = DateTime.UtcNow,
-                        CreatedAt          = DateTime.UtcNow,
-                        ConfirmedAt        = DateTime.UtcNow,
-                    };
-                    _db.EventRegistrations.Add(reg);
-                    await _db.SaveChangesAsync();
-
-                    var allItems = new List<PaymentItem>();
-
-                    // Groups + Participants
-                    foreach (var gDto in req.Groups)
-                    {
-                        var program = await _db.Programs
-                            .FromSqlRaw(
-                                "SELECT * FROM Programs WITH (UPDLOCK, ROWLOCK) WHERE ProgramID = {0}",
-                                gDto.ProgramId)
-                            .FirstOrDefaultAsync();
-
-                        if (program == null)
-                        {
-                            await tx.RollbackAsync();
-                            return NotFound(new { message = $"Program '{gDto.ProgramName}' not found." });
-                        }
-
-                        if (!program.IsActive || program.Status == "closed")
-                        {
-                            await tx.RollbackAsync();
-                            return BadRequest(new { message = $"'{gDto.ProgramName}' is no longer accepting registrations." });
-                        }
-
-                        var activeGroupCount = await _db.ParticipantGroups
-                            .CountAsync(g => g.ProgramId == gDto.ProgramId
-                                && g.GroupStatus != "Cancelled");
-
-                        if (activeGroupCount >= program.MaxParticipants)
-                        {
-                            await tx.RollbackAsync();
-                            return BadRequest(new { message = $"'{gDto.ProgramName}' is full. No slots remaining." });
-                        }
-
-                                        // Duplicate check (participant identity)
-                        var incomingParticipants = gDto.Participants
-                            .Select(p => new
-                            {
-                                p.FullName,
-                                Dob = string.IsNullOrWhiteSpace(p.Dob) ? (DateOnly?)null : DateOnly.Parse(p.Dob),
-                            }).ToList();
-
-                            var existingParticipants = await _db.ParticipantGroups
-                                .Where(g => g.ProgramId == gDto.ProgramId && g.GroupStatus != "Cancelled")
-                                .SelectMany(g => g.Participants)
-                                .Select(p => new { p.FullName, p.DateOfBirth })
-                                .ToListAsync();
-
-                            var isDuplicate = incomingParticipants.Any(incoming =>
-                                existingParticipants.Any(existing =>
-                                    existing.FullName == incoming.FullName
-                                    && existing.DateOfBirth == incoming.Dob));
-
-
-                        if (isDuplicate)
-                        {
-                            await tx.RollbackAsync();
-                            return BadRequest(new { message = $"One or more participants are already registered for '{gDto.ProgramName}'." });
-                        }
-
-                        var group = new ParticipantGroup
-                        {
-                            RegistrationId = reg.RegistrationId,
-                            EventId        = req.EventId,
-                            ProgramId      = gDto.ProgramId,
-                            ProgramName    = gDto.ProgramName,
-                            Fee            = gDto.Fee,
-                            GroupStatus    = "Confirmed",
-                            CreatedAt      = DateTime.UtcNow,
-                        };
-                        _db.ParticipantGroups.Add(group);
-                        await _db.SaveChangesAsync();
-
-                        var parts = new List<Participant>();
-                        foreach (var pDto in gDto.Participants)
-                        {
-                            var p = new Participant
-                            {
-                                GroupId            = group.GroupId,
-                                FullName           = pDto.FullName,
-                                DateOfBirth        = pDto.Dob != null ? DateOnly.Parse(pDto.Dob) : null,
-                                Gender             = pDto.Gender,
-                                Nationality        = pDto.Nationality,
-                                ClubSchoolCompany  = pDto.ClubSchoolCompany,
-                                Email              = pDto.Email,
-                                ContactNumber      = pDto.ContactNumber,
-                                TshirtSize         = pDto.TshirtSize,
-                                SbaId              = pDto.SbaId,
-                                GuardianName       = pDto.GuardianName,
-                                GuardianContact    = pDto.GuardianContact,
-                                DocumentUrl        = pDto.DocumentUrl,
-                                Remark             = pDto.Remark,
-                                CreatedAt          = DateTime.UtcNow,
-                            };
-                            _db.Participants.Add(p);
-                            parts.Add(p);
-                        }
-                        await _db.SaveChangesAsync();
-
-                        // Custom field values
-                        // Frontend sends { "Field Label": "value" } - resolve label -> CustomFieldId
-                        // via pre-loaded lookup. Drop unknown labels with a warning rather than
-                        // saving rows that would violate the FK on CustomFieldId.
-                        var cfLookup = customFieldsByProgram.GetValueOrDefault(gDto.ProgramId)
-                                       ?? new Dictionary<string, int>();
-                        for (int pi = 0; pi < gDto.Participants.Count; pi++)
-                        {
-                            foreach (var (label, val) in gDto.Participants[pi].CustomFieldValues)
-                            {
-                                if (!cfLookup.TryGetValue(label, out var cfId))
-                                {
-                                    _logger.LogWarning(
-                                        "Custom field label '{Label}' not found for program {ProgramId} - skipping",
-                                        label, gDto.ProgramId);
-                                    continue;
-                                }
-                                _db.ParticipantCustomFieldValues.Add(new ParticipantCustomFieldValue
-                                {
-                                    ParticipantId = parts[pi].ParticipantId,
-                                    CustomFieldId = cfId,
-                                    FieldLabel    = label,
-                                    FieldValue    = val,
-                                });
-                            }
-                        }
-
-                        group.ClubDisplay  = parts.FirstOrDefault()?.ClubSchoolCompany ?? "";
-                        group.NamesDisplay = string.Join(" / ", parts.Select(p => p.FullName));
-
-                        // Payment items
-                        foreach (var iDto in gDto.Items)
-                        {
-                            int? participantId = null;
-                            if (iDto.ParticipantIndex.HasValue && iDto.ParticipantIndex < parts.Count)
-                                participantId = parts[iDto.ParticipantIndex.Value].ParticipantId;
-
-                            allItems.Add(new PaymentItem
-                            {
-                                GroupId     = group.GroupId,
-                                EventId     = req.EventId,
-                                ProgramId   = gDto.ProgramId,
-                                ProgramName = iDto.ProgramName,
-                                Description = iDto.Description,
-                                PlayerName  = iDto.PlayerName,
-                                Amount      = iDto.Amount,
-                                ItemStatus  = "S",   // immediately confirmed
-                                CreatedAt   = DateTime.UtcNow,
-                                ParticipantId = participantId,
-                            });
-                        }
-                    }
-
-                    // Receipt number
-                    var receiptNo = $"TRS-{DateTime.UtcNow:yyyyMMdd}-{Random.Shared.Next(10000, 99999):D5}";
-
-                    // Payment record - written as Success immediately
-                    var payment = new Payment
-                    {
-                        RegistrationId   = reg.RegistrationId,
-                        EventId          = req.EventId,
-                        PaymentGateway   = "Stripe",
-                        PaymentMethod    = paymentMethod,
-                        Amount           = stripeAmount,
-                        Currency         = req.Payment?.Currency ?? "SGD",
-                        PaymentStatus    = "S",
-                        GatewaySessionId = request.GatewaySessionId,
-                        GatewayPaymentId = session.PaymentIntentId,
-                        ReceiptNumber    = receiptNo,
-                        CreatedAt        = DateTime.UtcNow,
-                        PaidAt           = DateTime.UtcNow,
-                    };
-                    _db.Payments.Add(payment);
-                    await _db.SaveChangesAsync();
-
-                    foreach (var item in allItems)
-                    {
-                        item.PaymentId = payment.PaymentId;
-                        _db.PaymentItems.Add(item);
-                    }
-                    await _db.SaveChangesAsync();
-
-                    await tx.CommitAsync();
-
-                    _logger.LogInformation(
-                        "confirm-session: created registration {RegId} receipt {Receipt} for session {SessionId}",
-                        reg.RegistrationId, receiptNo, request.GatewaySessionId);
-
-                    // ── Purge PendingCheckout row — registration is now safely in DB ──
-                    try
-                    {
-                        var pending = await _db.PendingCheckouts
-                            .FindAsync(request.GatewaySessionId);
-                        if (pending != null)
-                        {
-                            _db.PendingCheckouts.Remove(pending);
-                            await _db.SaveChangesAsync();
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        // Non-fatal: row will be cleaned up by PaymentCleanupWorker.
-                        _logger.LogWarning(ex,
-                            "Failed to purge PendingCheckout for session {SessionId}",
-                            request.GatewaySessionId);
-                    }
-
-                    // Queue background job: generate receipt PDF + send email
-                    var regIdForJob = reg.RegistrationId;
-                    var payIdForJob = payment.PaymentId;
-                    await _jobQueue.EnqueueAsync(async ct =>
-                    {
-                        using var scope = _serviceScopeFactory.CreateScope();
-                        var receiptSvc = scope.ServiceProvider.GetRequiredService<ReceiptService>();
-                        var emailSvc   = scope.ServiceProvider.GetRequiredService<EmailService>();
-                        var jobDb      = scope.ServiceProvider.GetRequiredService<TRSDbContext>();
-                        try
-                        {
-                            var pdfBytes = await receiptSvc.GenerateAsync(jobDb, regIdForJob);
-                            await emailSvc.SendPaymentConfirmationAsync(jobDb, regIdForJob, pdfBytes, ct);
-                            _logger.LogInformation("Receipt generated for registration {RegId}", regIdForJob);
-                        }
-                        catch (Exception ex)
-                        {
-                            _logger.LogError(ex, "Failed to generate receipt for payment {PaymentId}", payIdForJob);
-                        }
-                    });
-
-                    return Ok(new { registrationId = reg.RegistrationId.ToString() });
-                }
-                catch (Exception ex)
-                {
-                    await tx.RollbackAsync();
-                    _logger.LogError(ex, "Error writing registration for session {SessionId}",
-                        request.GatewaySessionId);
-                    return StatusCode(500, new { message = "Failed to save registration. Please contact the organiser." });
-                }
+                verifiedSession = await verifiedSessionService.GetAsync(request.GatewaySessionId);
             }
-            catch (Exception ex)
+            catch (StripeException ex)
             {
-                _logger.LogError(ex, "Unexpected error in confirm-session for {SessionId}",
-                    request.GatewaySessionId);
-                return StatusCode(500, new { message = "An unexpected error occurred." });
+                _logger.LogWarning(ex, "Stripe session not found: {SessionId}", request.GatewaySessionId);
+                return BadRequest(new { message = "Payment session not found. Please contact the organiser." });
             }
+
+            if (verifiedSession.PaymentStatus != "paid")
+            {
+                _logger.LogWarning("Session {SessionId} not paid - status: {Status}", request.GatewaySessionId, verifiedSession.PaymentStatus);
+                return BadRequest(new { message = "Payment has not been confirmed by Stripe." });
+            }
+
+            var result = await _paymentFinalization.FinalizeSessionFirstAsync(verifiedSession);
+            if (!result.Success)
+            {
+                if (string.Equals(result.Code, "CHECKOUT_CONTEXT_MISSING", StringComparison.Ordinal))
+                    return Conflict(new { code = result.Code, message = result.Message });
+
+                var isNotFound = string.Equals(result.Code, "EVENT_NOT_FOUND", StringComparison.Ordinal)
+                    || string.Equals(result.Code, "PROGRAM_NOT_FOUND", StringComparison.Ordinal);
+                return isNotFound
+                    ? NotFound(new { code = result.Code, message = result.Message })
+                    : BadRequest(new { code = result.Code, message = result.Message });
+            }
+
+            return Ok(new { registrationId = result.RegistrationId.ToString() });
         }
 
 
