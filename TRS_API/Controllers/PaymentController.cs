@@ -1,4 +1,4 @@
-using Microsoft.AspNetCore.Mvc;
+﻿using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
 using System.Text.Json;
@@ -194,13 +194,68 @@ namespace TRS_API.Controllers
 
             if (isPayNow) options.ExpiresAt = DateTime.UtcNow.AddMinutes(30);
 
+            // ── ONE ACTIVE PAYMENT LOCK RULE ─────────────────────────────────
+            // Enforce: user + event = at most ONE active PendingCheckout.
+            // If a non-expired row exists for this email + event, reuse its
+            // Stripe session rather than creating a new one.  This prevents
+            // duplicate payments from rapid retries or multiple browser tabs.
+            var existingActive = await _db.PendingCheckouts
+                .Where(p => p.EventId == payload.EventId
+                        && p.ContactEmail == (payload.ContactEmail ?? "")
+                        && p.PaymentMethod == dbMethod
+                        && p.ExpiresAt > DateTime.UtcNow)
+                .OrderByDescending(p => p.CreatedAt)
+                .FirstOrDefaultAsync();
+
+            if (existingActive != null)
+            {
+                // Retrieve the existing Stripe session to get its checkout URL.
+                Session? existingSession = null;
+                try
+                {
+                    existingSession = await new SessionService().GetAsync(existingActive.GatewaySessionId);
+                }
+                catch (StripeException ex)
+                {
+                    // Session not found on Stripe (e.g. already expired there but not yet
+                    // pruned locally) — fall through to create a new one.
+                    _logger.LogWarning(ex,
+                        "Existing PendingCheckout session {SessionId} not found on Stripe; creating new session",
+                        existingActive.GatewaySessionId);
+                    existingSession = null;
+                }
+
+                if (existingSession != null && existingSession.Status == "open")
+                {
+                    _logger.LogInformation(
+                        "Reusing existing active PendingCheckout session {SessionId} for event {EventId} contact {Email}",
+                        existingActive.GatewaySessionId, payload.EventId, payload.ContactEmail);
+
+                    // Always update the stored payload to the latest cart so webhook
+                    // recovery reflects current selections if the user changed anything.
+                    existingActive.PayloadJson   = request.RegistrationPayload!.Value.GetRawText();
+                    existingActive.PaymentMethod = dbMethod;
+                    await _db.SaveChangesAsync();
+
+                    return Ok(new
+                    {
+                        checkoutUrl      = existingSession.Url,
+                        gatewaySessionId = existingActive.GatewaySessionId,
+                        paymentMethod    = dbMethod,
+                        expiresAt        = existingActive.ExpiresAt
+                    });
+                }
+
+                // Session is no longer open on Stripe — remove stale local row so we
+                // can create a fresh session below.
+                _db.PendingCheckouts.Remove(existingActive);
+                await _db.SaveChangesAsync();
+            }
+
             // PayNow sessions expire after 30 minutes, so rotate the idempotency key on the
             // same cadence to avoid Stripe returning an expired checkout session on retry.
-      
             var idempotencyKey = $"sf_{payload.EventId}_{method}_{payload.ContactEmail}_{(int)(totalAmount * 100)}_{DateTimeOffset.UtcNow.ToUnixTimeSeconds() / 600}";
             var requestOptions = new RequestOptions { IdempotencyKey = idempotencyKey };
-
-
 
             var session = await new SessionService().CreateAsync(options, requestOptions);
 

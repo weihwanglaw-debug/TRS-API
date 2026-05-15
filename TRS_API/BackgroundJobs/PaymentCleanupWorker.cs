@@ -19,7 +19,10 @@ public class PaymentCleanupWorker : BackgroundService
             var db = scope.ServiceProvider.GetRequiredService<TRSDbContext>();
 
             await PruneExpiredPendingCheckouts(db, stoppingToken);
-            await CancelStalePayments(db, stoppingToken);
+            // NOTE: CancelStalePayments intentionally removed.
+            // Stripe payments are asynchronous — a pending payment is NEVER failed
+            // due to timeout. Only an explicit Stripe failure event marks a payment failed.
+            // See: CORE PRINCIPLE — TIMEOUT ≠ FAILURE.
         }
     }
 
@@ -59,46 +62,6 @@ public class PaymentCleanupWorker : BackgroundService
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error pruning expired PendingCheckout rows");
-        }
-    }
-
-    // ── Cancel stale pending paid-gateway payments ────────────────────────────
-    // Only cancels legacy paid registrations (Amount > 0, PaymentStatus = "P")
-    // that have been pending for more than 24 hours.
-    //
-    // Session-first paid registrations never write a Pending payment to the DB,
-    // so there is nothing to cancel for those.
-    //
-    // Free registrations (Amount = 0) stay Pending until an admin manually
-    // confirms them — they are explicitly excluded here.
-    private async Task CancelStalePayments(TRSDbContext db, CancellationToken ct)
-    {
-        try
-        {
-            var expired = await db.Payments
-                .Where(p => p.PaymentStatus == "P"
-                         && p.Amount > 0                           // exclude free registrations
-                         && p.CreatedAt < DateTime.UtcNow.AddHours(-24))
-                .ToListAsync(ct);
-
-            if (!expired.Any()) return;
-
-            var expiredRegIds = expired.Select(p => p.RegistrationId).ToList();
-
-            var regs = await db.EventRegistrations
-                .Where(r => expiredRegIds.Contains(r.RegistrationId) && r.RegStatus == "Pending")
-                .ToListAsync(ct);
-
-            foreach (var p in expired) { p.PaymentStatus = "X"; p.UpdatedAt = DateTime.UtcNow; }
-            foreach (var r in regs)    { r.RegStatus = "Cancelled"; r.RegistrationStatus = "X"; r.UpdatedAt = DateTime.UtcNow; }
-
-            await db.SaveChangesAsync(ct);
-            _logger.LogInformation(
-                "Expired {Count} stale pending paid-gateway payments → status X", expired.Count);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error cancelling stale pending payments");
         }
     }
 }
