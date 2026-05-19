@@ -372,19 +372,33 @@ public class RegistrationWorkflowService
 
     private async Task<bool> FindDuplicateAsync(CreateGroupDto group, int programId, CancellationToken ct)
     {
-        var incomingParticipants = group.Participants
+
+               // Step 1: Server-side — EF translates these two predicates fine
+        var existingParticipants = await _db.ParticipantGroups
+            .Where(g =>
+                g.ProgramId == programId &&
+                g.GroupStatus != "Cancelled")
+            .SelectMany(g => g.Participants.Select(p => new
+            {
+                p.FullName,
+                p.DateOfBirth
+            }))
+            .ToListAsync(ct);
+
+        // Step 2: Client-side — plain LINQ against two in-memory lists
+        var incoming = group.Participants
             .Select(p => new
             {
                 p.FullName,
-                Dob = ParseDob(p.Dob),
+                Dob = ParseDob(p.Dob)
             })
             .ToList();
+    
+        return existingParticipants.Any(existing =>
+            incoming.Any(i =>
+                string.Equals(i.FullName, existing.FullName, StringComparison.OrdinalIgnoreCase)
+                && i.Dob == existing.DateOfBirth));
 
-        return await _db.ParticipantGroups
-            .AnyAsync(g => g.ProgramId == programId
-                && g.GroupStatus != "Cancelled"
-                && g.Participants.Any(existing => incomingParticipants.Any(incoming =>
-                    incoming.FullName == existing.FullName && incoming.Dob == existing.DateOfBirth)), ct);
     }
 
     private RegistrationWorkflowResult<object> ValidateParticipants(
