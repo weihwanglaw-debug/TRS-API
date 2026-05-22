@@ -427,7 +427,10 @@ namespace TRS_API.Controllers
             Session verifiedSession;
             try
             {
-                verifiedSession = await verifiedSessionService.GetAsync(request.GatewaySessionId);
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                verifiedSession = await verifiedSessionService.GetAsync(
+                    request.GatewaySessionId,
+                    cancellationToken: cts.Token);
             }
             catch (StripeException ex)
             {
@@ -452,6 +455,32 @@ namespace TRS_API.Controllers
                 return isNotFound
                     ? NotFound(new { code = result.Code, message = result.Message })
                     : BadRequest(new { code = result.Code, message = result.Message });
+            }
+
+            // Send confirmation email when confirm-session wins the race
+            // (alreadyProcessed = webhook got there first — email already sent by webhook job)
+            if (!result.AlreadyProcessed)
+            {
+                var regIdForJob = result.RegistrationId;
+                await _jobQueue.EnqueueAsync(async ct =>
+                {
+                    using var scope    = _serviceScopeFactory.CreateScope();
+                    var receiptSvc     = scope.ServiceProvider.GetRequiredService<ReceiptService>();
+                    var emailSvc       = scope.ServiceProvider.GetRequiredService<EmailService>();
+                    var jobDb          = scope.ServiceProvider.GetRequiredService<TRSDbContext>();
+                    try
+                    {
+                        var pdfBytes = await receiptSvc.GenerateAsync(jobDb, regIdForJob);
+                        await emailSvc.SendPaymentConfirmationAsync(jobDb, regIdForJob, pdfBytes, ct);
+                        _logger.LogInformation(
+                            "Confirmation email sent for registration {RegId} via confirm-session path", regIdForJob);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex,
+                            "Failed to send confirmation email for registration {RegId}", regIdForJob);
+                    }
+                });
             }
 
             return Ok(new { registrationId = result.RegistrationId.ToString() });

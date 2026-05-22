@@ -409,6 +409,32 @@ public class RegistrationsController : ControllerBase
         if (participant == null)
             return NotFound(new { code = "NOT_FOUND", message = "Participant not found in this registration." });
 
+        // ── Duplicate check — only when FullName or Dob is being changed ──────
+        // Excludes self (pid) so editing other fields on an existing participant
+        // does not false-flag against its own record.
+        if (req.FullName != null || req.Dob != null)
+        {
+            var checkName = req.FullName ?? participant.FullName;
+            var checkDob  = participant.DateOfBirth; // default to existing
+            if (req.Dob != null && DateOnly.TryParse(req.Dob, out var parsedDob))
+                checkDob = parsedDob;
+
+            var isDuplicate = await _db.Participants
+                .Where(p =>
+                    p.ParticipantId != pid &&
+                    p.Group.ProgramId == participant.Group.ProgramId &&
+                    p.Group.GroupStatus != "Cancelled" &&
+                    p.FullName == checkName &&
+                    p.DateOfBirth == checkDob)
+                .AnyAsync();
+
+            if (isDuplicate)
+                return Conflict(new {
+                    code    = "DUPLICATE_PARTICIPANT",
+                    message = $"{checkName} with this date of birth is already registered in this program."
+                });
+        }
+
         // Capture old values for audit (TODO: write to ParticipantAuditLog)
         // var oldValues = new { participant.FullName, participant.DateOfBirth, ... };
 
@@ -423,6 +449,7 @@ public class RegistrationsController : ControllerBase
         if (req.GuardianName      != null) participant.GuardianName      = req.GuardianName;
         if (req.GuardianContact   != null) participant.GuardianContact   = req.GuardianContact;
         if (req.Remark            != null) participant.Remark            = req.Remark;
+        if (req.DocumentUrl       != null) participant.DocumentUrl       = req.DocumentUrl;
 
         if (req.Dob != null)
             participant.DateOfBirth = string.IsNullOrWhiteSpace(req.Dob)
@@ -432,14 +459,34 @@ public class RegistrationsController : ControllerBase
         // Update custom field values (upsert by label)
         if (req.CustomFieldValues != null)
         {
+            // Load program custom field definitions to resolve CustomFieldId
+            // for labels that have no existing row (field added after registration).
+            var programFields = await _db.ProgramCustomFields
+                .Where(cf => cf.ProgramId == participant.Group.ProgramId)
+                .ToDictionaryAsync(cf => cf.Label, cf => cf.CustomFieldId);
+
             foreach (var (label, value) in req.CustomFieldValues)
             {
                 var existing = participant.CustomFieldValues
                     .FirstOrDefault(cf => cf.FieldLabel == label);
+
                 if (existing != null)
+                {
                     existing.FieldValue = value;
-                // Note: we don't add new custom fields here â€” only update existing ones.
-                // New custom fields are defined at program level.
+                }
+                else if (programFields.TryGetValue(label, out var customFieldId))
+                {
+                    // Insert new row — field was added to the program after this
+                    // participant registered so no row existed yet.
+                    _db.ParticipantCustomFieldValues.Add(new ParticipantCustomFieldValue
+                    {
+                        ParticipantId = participant.ParticipantId,
+                        CustomFieldId = customFieldId,
+                        FieldLabel    = label,
+                        FieldValue    = value,
+                    });
+                }
+                // Label not found in program fields = renamed/deleted — skip silently.
             }
         }
 

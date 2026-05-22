@@ -1,4 +1,4 @@
-using Microsoft.AspNetCore.Authorization;
+﻿using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using Stripe;
@@ -158,6 +158,30 @@ namespace TRS_API.Controllers
                     "checkout.session.completed",
                     System.Text.Json.JsonSerializer.Serialize(session),
                     result.AlreadyProcessed ? "I" : "S");
+
+                //enqueue email if webhook won the race
+                if (!result.AlreadyProcessed)
+                {
+                    var regIdForJob = result.RegistrationId;
+                    await _jobQueue.EnqueueAsync(async ct =>
+                    {
+                        using var scope = _serviceScopeFactory.CreateScope();
+                        var receiptSvc  = scope.ServiceProvider.GetRequiredService<ReceiptService>();
+                        var emailSvc    = scope.ServiceProvider.GetRequiredService<EmailService>();
+                        var jobDb       = scope.ServiceProvider.GetRequiredService<TRSDbContext>();
+                        try
+                        {
+                            var pdfBytes = await receiptSvc.GenerateAsync(jobDb, regIdForJob);
+                            await emailSvc.SendPaymentConfirmationAsync(jobDb, regIdForJob, pdfBytes, ct);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogError(ex,
+                                "Failed to send confirmation email for registration {RegId}", regIdForJob);
+                        }
+                    });
+                }
+
                 return;
 
             }
@@ -417,12 +441,13 @@ namespace TRS_API.Controllers
                 return;
 
             PaymentController.ApplyRefundOutcome(payment);
+            await _db.SaveChangesAsync();   // ← persist refund status + item status changes
             await UpsertWebhookLogAsync(
                 eventId,
                 "charge.refunded",
                 System.Text.Json.JsonSerializer.Serialize(charge),
                 "S");
-        }
+                    }
 
         private static bool IsRetryableFinalizationFailure(string? code) =>
             string.Equals(code, "CREATE_FAILED", StringComparison.Ordinal);

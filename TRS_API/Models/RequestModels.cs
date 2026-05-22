@@ -297,6 +297,8 @@ public class UpdateParticipantRequest
     public string? Remark            { get; set; }
     // Custom field values keyed by label (same shape as create)
     public Dictionary<string, string>? CustomFieldValues { get; set; }
+    // Document URL — set when admin replaces an uploaded file via the participant edit modal
+    public string? DocumentUrl { get; set; }
 }
 
 // ── Extended manual payment confirm ──────────────────────────────────────────
