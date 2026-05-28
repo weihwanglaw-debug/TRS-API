@@ -37,7 +37,7 @@ public class RegistrationsController : ControllerBase
         => (_db, _log, _receipt, _jobQueue, _serviceScopeFactory, _registrationWorkflow) =
             (db, log, receipt, jobQueue, serviceScopeFactory, registrationWorkflow);
 
-    // â”€â”€ GET /api/registrations  â”€â”€ admin, paged + filtered â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // -- GET /api/registrations  -- admin, paged + filtered -----------------
     [HttpGet, Authorize(Roles = "superadmin,eventadmin")]
     public async Task<IActionResult> GetAll(
         [FromQuery] int? eventId, [FromQuery] int? programId,
@@ -74,7 +74,7 @@ public class RegistrationsController : ControllerBase
         });
     }
 
-    // â”€â”€ GET /api/registrations/:id  â”€â”€ public (for PaymentResult receipt) â”€â”€
+    // -- GET /api/registrations/:id  -- public (for PaymentResult receipt) --
     [HttpGet("{id:int}")]
     public async Task<IActionResult> GetById(int id)
     {
@@ -83,7 +83,7 @@ public class RegistrationsController : ControllerBase
         return Ok(MapReg(reg));
     }
 
-    // â”€â”€ POST /api/registrations  â”€â”€ public â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // -- POST /api/registrations  -- public ---------------------------------
     [EnableRateLimiting("payment")]
     [HttpPost]
     public async Task<IActionResult> Create([FromBody] CreateRegistrationRequest req)
@@ -115,7 +115,7 @@ public class RegistrationsController : ControllerBase
         return Ok(MapReg(createdReg!));
     }
 
-    // â”€â”€ PATCH /api/registrations/:id/status  â”€â”€ admin â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // -- PATCH /api/registrations/:id/status  -- admin ----------------------
     [HttpPatch("{id:int}/status"), Authorize(Roles = "superadmin,eventadmin")]
     public async Task<IActionResult> UpdateStatus(int id, [FromBody] UpdateRegStatusRequest req)
     {
@@ -146,7 +146,7 @@ public class RegistrationsController : ControllerBase
         return Ok(MapReg(updated!));
     }
 
-    // â”€â”€ PATCH /api/registrations/:id/groups/:gid/status  â”€â”€ admin â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // -- PATCH /api/registrations/:id/groups/:gid/status  -- admin ----------
     [HttpPatch("{id:int}/groups/{gid:int}/status"), Authorize(Roles = "superadmin,eventadmin")]
     public async Task<IActionResult> UpdateGroupStatus(int id, int gid, [FromBody] UpdateRegStatusRequest req)
     {
@@ -162,7 +162,7 @@ public class RegistrationsController : ControllerBase
         return Ok(MapReg(updated!));
     }
 
-    // â”€â”€ PATCH /api/registrations/:id/groups/:gid/seed  â”€â”€ admin â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // -- PATCH /api/registrations/:id/groups/:gid/seed  -- admin -------------
     [HttpPatch("{id:int}/groups/{gid:int}/seed"), Authorize(Roles = "superadmin,eventadmin")]
     public async Task<IActionResult> UpdateGroupSeed(int id, int gid, [FromBody] UpdateSeedRequest req)
     {
@@ -175,21 +175,25 @@ public class RegistrationsController : ControllerBase
         return Ok(MapReg(updated!));
     }
 
-    // â”€â”€ GET /api/registrations/:id/payment  â”€â”€ admin â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // -- GET /api/registrations/:id/payment  -- admin -----------------------
     [HttpGet("{id:int}/payment"), Authorize(Roles = "superadmin,eventadmin")]
     public async Task<IActionResult> GetPayment(int id)
     {
-        var payment = await _db.Payments.Include(p => p.Items)
+        var payment = await _db.Payments
+            .Include(p => p.Items)
+            .Include(p => p.Refunds)
             .FirstOrDefaultAsync(p => p.RegistrationId == id);
         if (payment == null) return NotFound(new { code = "NOT_FOUND", message = "Payment not found." });
         return Ok(MapPayment(payment));
     }
 
-    // â”€â”€ PATCH /api/registrations/:id/payment  â”€â”€ admin (manual confirm) â”€â”€â”€â”€
+    // -- PATCH /api/registrations/:id/payment  -- admin (manual confirm) ----
     [HttpPatch("{id:int}/payment"), Authorize(Roles = "superadmin,eventadmin")]
     public async Task<IActionResult> UpdatePayment(int id, [FromBody] UpdatePaymentManualRequest req)
     {
-        var payment = await _db.Payments.Include(p => p.Items)
+        var payment = await _db.Payments
+            .Include(p => p.Items)
+            .Include(p => p.Refunds)
             .FirstOrDefaultAsync(p => p.RegistrationId == id);
         if (payment == null) return NotFound(new { code = "NOT_FOUND", message = "Payment not found." });
 
@@ -198,11 +202,20 @@ public class RegistrationsController : ControllerBase
         // Translate long-form frontend status ("Success") â†’ DB short code ("S")
         // This also prevents truncation errors on the VARCHAR(2) column.
         if (req.PaymentStatus != null)
-            payment.PaymentStatus = PayStatusToDb(req.PaymentStatus);
+        {
+            var targetStatus = PayStatusToDb(req.PaymentStatus);
+            if (!CanAdminSetPaymentStatus(payment.PaymentStatus, targetStatus))
+                return Conflict(new
+                {
+                    code = "INVALID_TRANSITION",
+                    message = $"Cannot change payment status from {payment.PaymentStatus} to {targetStatus}."
+                });
+            payment.PaymentStatus = targetStatus;
+        }
 
         if (req.ReceiptNo != null) payment.ReceiptNumber = req.ReceiptNo;
 
-        // payment.PaymentStatus is now always a short code â€” safe to compare with "S"
+        // payment.PaymentStatus is now always a short code - safe to compare with "S"
         if (payment.PaymentStatus == "S")
         {
             payment.PaidAt = DateTime.UtcNow;
@@ -238,7 +251,7 @@ public class RegistrationsController : ControllerBase
         return Ok(MapReg(updated!));
     }
 
-    // â”€â”€ GET /api/registrations/:id/payment/refunds  â”€â”€ admin â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // -- GET /api/registrations/:id/payment/refunds  -- admin ---------------
     [HttpGet("{id:int}/payment/refunds"), Authorize(Roles = "superadmin,eventadmin")]
     public async Task<IActionResult> GetRefunds(int id)
     {
@@ -264,7 +277,7 @@ public class RegistrationsController : ControllerBase
         }));
     }
 
-    // â”€â”€ POST /api/registrations/:id/payment/refunds  â”€â”€ admin â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // -- POST /api/registrations/:id/payment/refunds  -- admin --------------
     [HttpPost("{id:int}/payment/refunds"), Authorize(Roles = "superadmin,eventadmin")]
     public async Task<IActionResult> InitiateRefund(int id, [FromBody] InitiateRefundRequest req)
     {
@@ -316,11 +329,18 @@ public class RegistrationsController : ControllerBase
         var errors = new List<string>();
         foreach (var item in payment.Items.Where(i => i.ItemStatus == "S").ToList())
         {
+            var alreadyRefunded = await _db.Refunds
+                .Where(r => r.PaymentItemId == item.PaymentItemId && r.RefundStatus == "S")
+                .SumAsync(r => (decimal?)r.RefundAmount) ?? 0m;
+            var remainingRefundAmount = item.Amount - alreadyRefunded;
+            if (remainingRefundAmount <= 0)
+                continue;
+
             var refund = await ProcessRefundItemAsync(
                 id,
                 payment,
                 item,
-                item.Amount,
+                remainingRefundAmount,
                 $"Cancelled: {req.Reason}");
 
             if (!refund.Success)
@@ -335,7 +355,7 @@ public class RegistrationsController : ControllerBase
         return Ok(new { registration = MapReg(updated!), errors });
     }
 
-    // â”€â”€ GET /api/registrations/export  â”€â”€ admin â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // -- GET /api/registrations/export  -- admin -----------------------------
     [HttpGet("export"), Authorize(Roles = "superadmin,eventadmin")]
     public async Task<IActionResult> Export([FromQuery] int? eventId, [FromQuery] int? programId)
     {
@@ -349,7 +369,7 @@ public class RegistrationsController : ControllerBase
         return Ok(items.Select(MapReg));
     }
 
-    // â”€â”€ GET /api/registrations/stats  â”€â”€ admin â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // -- GET /api/registrations/stats  -- admin ------------------------------
     [HttpGet("stats"), Authorize(Roles = "superadmin,eventadmin")]
     public async Task<IActionResult> Stats([FromQuery] int? eventId)
     {
@@ -368,7 +388,7 @@ public class RegistrationsController : ControllerBase
         });
     }
 
-    // â”€â”€ GET /api/registrations/:id/receipt  â”€â”€ public â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // -- GET /api/registrations/:id/receipt  -- public -------------------------
     [HttpGet("{id:int}/receipt")]
     public async Task<IActionResult> GetReceipt(int id)
     {
@@ -393,7 +413,7 @@ public class RegistrationsController : ControllerBase
     }
 
 
-    // â”€â”€ PATCH /api/registrations/:id/participants/:pid  â”€â”€ admin â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // -- PATCH /api/registrations/:id/participants/:pid  -- admin -----------
     // Update individual participant details.
     // TODO (future): write each changed field to ParticipantAuditLog with
     //   OldValue, NewValue, ModifiedBy, ModifiedAt for full change history.
@@ -501,11 +521,11 @@ public class RegistrationsController : ControllerBase
         return Ok(MapReg(updated!));
     }
 
-    // â”€â”€ POST /api/registrations/:id/confirm  â”€â”€ admin â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    // Admin confirms a registration directly â€” bypasses online payment.
+    // -- POST /api/registrations/:id/confirm  -- admin ---------------------
+    // Admin confirms a registration directly - bypasses online payment.
     // Supports three payment outcomes:
-    //   S  = Paid (manual confirmation â€” cash/bank/PayNow collected)
-    //   W  = Waived (admin waives the fee entirely â€” VIP, staff, error correction)
+    //   S  = Paid (manual confirmation - cash/bank/PayNow collected)
+    //   W  = Waived (admin waives the fee entirely - VIP, staff, error correction)
     //   PC = Pending Collection (registration confirmed, payment to be collected later)
     [HttpPost("{id:int}/confirm"), Authorize(Roles = "superadmin,eventadmin")]
     public async Task<IActionResult> ConfirmRegistration(int id, [FromBody] ConfirmRegistrationRequest req)
@@ -540,6 +560,12 @@ public class RegistrationsController : ControllerBase
         }
         else
         {
+            if (!CanAdminSetPaymentStatus(payment.PaymentStatus, status))
+                return Conflict(new
+                {
+                    code = "INVALID_TRANSITION",
+                    message = $"Cannot change payment status from {payment.PaymentStatus} to {status}."
+                });
             if (req.Method != null) payment.PaymentMethod = req.Method;
             payment.PaymentStatus = status;
             payment.AdminNote     = req.AdminNote;
@@ -590,7 +616,7 @@ public class RegistrationsController : ControllerBase
         return Ok(MapReg(updated!));
     }
 
-    // â”€â”€ Load helper â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // -- Load helper ----------------------------------------------------------
     private Task<EventRegistration?> LoadReg(int id) =>
         _db.EventRegistrations
             .Include(r => r.ParticipantGroups).ThenInclude(g => g.Participants)
@@ -598,7 +624,7 @@ public class RegistrationsController : ControllerBase
             .Include(r => r.Payments).ThenInclude(p => p.Items)
             .FirstOrDefaultAsync(r => r.RegistrationId == id);
 
-    // â”€â”€ Status code translation helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // -- Status code translation helpers --------------------------------------
     // DB stores short codes; the frontend TypeScript types use long names.
     // All translation is centralised here so no other file needs to change.
 
@@ -609,18 +635,21 @@ public class RegistrationsController : ControllerBase
         decimal refundAmount,
         string? refundReason)
     {
-        var successfulRefund = await _db.Refunds
-            .FirstOrDefaultAsync(r => r.PaymentItemId == item.PaymentItemId && r.RefundStatus == "S");
-        if (successfulRefund != null)
+        var successfulRefunds = await _db.Refunds
+            .Where(r => r.PaymentItemId == item.PaymentItemId && r.RefundStatus == "S")
+            .ToListAsync();
+        var refundedAmount = successfulRefunds.Sum(r => r.RefundAmount);
+        var remainingAmount = item.Amount - refundedAmount;
+        if (remainingAmount <= 0)
         {
-            await ReconcileSuccessfulRefundAsync(payment, item, successfulRefund, refundReason);
-            return RefundOperationResult.Ok(successfulRefund);
+            await ReconcileRefundedAmountsAsync(payment, item);
+            return RefundOperationResult.Fail("ALREADY_REFUNDED", "This item is already fully refunded.");
         }
 
         if (item.ItemStatus != "S")
             return RefundOperationResult.Fail("INVALID_STATE", "Only confirmed items can be refunded.");
-        if (refundAmount > item.Amount)
-            return RefundOperationResult.Fail("OVER_REFUND", $"Maximum refundable is {item.Amount}.");
+        if (refundAmount > remainingAmount)
+            return RefundOperationResult.Fail("OVER_REFUND", $"Maximum refundable is {remainingAmount}.");
 
         var refund = await _db.Refunds
             .FirstOrDefaultAsync(r => r.PaymentItemId == item.PaymentItemId && r.RefundStatus == "P");
@@ -645,7 +674,17 @@ public class RegistrationsController : ControllerBase
                 CreatedAt = DateTime.UtcNow,
             };
             _db.Refunds.Add(refund);
-            await _db.SaveChangesAsync();
+            try
+            {
+                await _db.SaveChangesAsync();
+            }
+            catch (DbUpdateException ex)
+            {
+                _log.LogWarning(ex,
+                    "Duplicate active refund prevented for payment item {PaymentItemId}",
+                    item.PaymentItemId);
+                return RefundOperationResult.Fail("REFUND_IN_PROGRESS", "A refund for this item is already in progress.");
+            }
         }
 
         try
@@ -711,13 +750,7 @@ public class RegistrationsController : ControllerBase
         TRS_Data.Models.Refund refund,
         string? refundReason)
     {
-        if (item.ItemStatus != "R")
-        {
-            item.ItemStatus = "R";
-            item.UpdatedAt = DateTime.UtcNow;
-        }
-
-        PaymentController.ApplyRefundOutcome(payment);
+        await ReconcileRefundedAmountsAsync(payment, item);
         _db.PaymentAuditLogs.Add(new PaymentAuditLog
         {
             EntityType = "Refund",
@@ -729,6 +762,32 @@ public class RegistrationsController : ControllerBase
             CreatedAt = DateTime.UtcNow,
         });
         await _db.SaveChangesAsync();
+    }
+
+    private async Task ReconcileRefundedAmountsAsync(Payment payment, PaymentItem item)
+    {
+        var itemRefundedAmount = await _db.Refunds
+            .Where(r => r.PaymentItemId == item.PaymentItemId && r.RefundStatus == "S")
+            .SumAsync(r => (decimal?)r.RefundAmount) ?? 0m;
+
+        var newItemStatus = itemRefundedAmount >= item.Amount ? "R" : "S";
+        if (item.ItemStatus != newItemStatus)
+        {
+            item.ItemStatus = newItemStatus;
+            item.UpdatedAt = DateTime.UtcNow;
+        }
+
+        var paymentRefundedAmount = await _db.Refunds
+            .Where(r => r.PaymentId == payment.PaymentId && r.RefundStatus == "S")
+            .SumAsync(r => (decimal?)r.RefundAmount) ?? 0m;
+
+        payment.PaymentStatus = paymentRefundedAmount switch
+        {
+            <= 0m => "S",
+            var amount when amount >= payment.Amount => "FR",
+            _ => "PR",
+        };
+        payment.UpdatedAt = DateTime.UtcNow;
     }
 
     private static void ApplyRegistrationStatus(EventRegistration reg, string status)
@@ -775,10 +834,19 @@ public class RegistrationsController : ControllerBase
         "Cancelled"          => "X",
         "Waived"             => "W",
         "PendingCollection"  => "PC",
-        _                    => s    // already a short code â€” pass through
+        _                    => s    // already a short code - pass through
     };
 
-    // â”€â”€ Map helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    private static bool CanAdminSetPaymentStatus(string currentStatus, string targetStatus)
+    {
+        if (currentStatus == targetStatus) return true;
+        if (currentStatus is "PR" or "FR" or "F" or "X") return false;
+        if (currentStatus == "S") return targetStatus == "S";
+        if (currentStatus == "W") return targetStatus == "W";
+        return (currentStatus is "P" or "PC") && (targetStatus is "S" or "W" or "PC");
+    }
+
+    // -- Map helpers ----------------------------------------------------------
     private static object MapPayment(Payment p) => new
     {
         id = p.PaymentId.ToString(),

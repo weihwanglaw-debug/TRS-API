@@ -1,6 +1,7 @@
 ﻿using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
+using System.Security.Cryptography;
 using System.Text.Json;
 using Stripe;
 using Stripe.Checkout;
@@ -43,7 +44,6 @@ namespace TRS_API.Controllers
         }
 
         // -- GET /api/Payment/get-payment-info/:registrationId -----------------
-        // Used by the HTML checkout page to display the amount before payment.
         [HttpGet("get-payment-info/{registrationId}")]
         [EnableRateLimiting("payment")]
         public async Task<IActionResult> GetPaymentInfo(int registrationId)
@@ -62,12 +62,12 @@ namespace TRS_API.Controllers
 
                 return Ok(new
                 {
-                    registrationId = registration.RegistrationId,
-                    amount = registration.TotalAmount,
-                    currency = registration.Currency,
+                    registrationId     = registration.RegistrationId,
+                    amount             = registration.TotalAmount,
+                    currency           = registration.Currency,
                     registrationStatus = registration.RegistrationStatus,
-                    isPaid = existingPayment != null,
-                    message = existingPayment != null ? "Already paid" : null
+                    isPaid             = existingPayment != null,
+                    message            = existingPayment != null ? "Already paid" : null
                 });
             }
             catch (Exception ex)
@@ -78,17 +78,6 @@ namespace TRS_API.Controllers
         }
 
         // -- POST /api/Payment/create-checkout-session -------------------------
-        // Handles two paths:
-        //
-        // PATH A - Session-first (paid registrations, new flow):
-        //   Frontend sends: { registrationPayload: {...}, paymentMethod, successUrl, cancelUrl }
-        //   Backend: computes amount from payload, creates Stripe session, returns checkoutUrl.
-        //   NO database write. DB insert happens in /api/registrations/confirm-session
-        //   after the user returns from Stripe with a successful payment.
-        //
-        // PATH B - Legacy (free registrations, unchanged):
-        //   Frontend sends: { registrationId, paymentMethod, successUrl, cancelUrl }
-        //   Backend: reads amount from DB, creates Stripe session, returns checkoutUrl.
         [EnableRateLimiting("payment")]
         [HttpPost("create-checkout-session")]
         public async Task<IActionResult> CreateCheckoutSession([FromBody] PaymentRequest? request)
@@ -98,13 +87,9 @@ namespace TRS_API.Controllers
 
             try
             {
-                // -- PATH A: Session-first paid flow ---------------------------
                 if (request.IsSessionFirst)
-                {
                     return await CreateSessionFirstCheckout(request);
-                }
 
-                // -- PATH B: Legacy free-registration flow ---------------------
                 if (request.RegistrationId <= 0)
                     return BadRequest(new { message = "Invalid registration ID" });
 
@@ -149,19 +134,22 @@ namespace TRS_API.Controllers
             var totalAmount = pricing.Value!.TotalAmount;
             if (totalAmount <= 0)
                 return BadRequest(new { message = "Total amount must be greater than zero" });
+            var expectedAmountCents = ToMinorUnits(totalAmount);
+            var newPayloadJson = request.RegistrationPayload!.Value.GetRawText();
+            var newPayloadHash = ComputePayloadHash(newPayloadJson);
 
-            var currency = pricing.Value.Currency;
-            var method = (request.PaymentMethod ?? "card").ToLower().Trim();
-            var isPayNow = method == "paynow";
+            var currency    = pricing.Value.Currency;
+            var method      = (request.PaymentMethod ?? "card").ToLower().Trim();
+            var isPayNow    = method == "paynow";
             var stripeMethod = isPayNow ? "paynow" : "card";
-            var dbMethod = isPayNow ? "PayNow" : "CreditCard";
+            var dbMethod    = isPayNow ? "PayNow" : "CreditCard";
 
             if (isPayNow && !currency.Equals("SGD", StringComparison.OrdinalIgnoreCase))
                 return BadRequest(new { message = "PayNow is only available for SGD payments." });
 
             var options = new SessionCreateOptions
             {
-                Mode = "payment",
+                Mode               = "payment",
                 PaymentMethodTypes = new List<string> { stripeMethod },
                 LineItems = new List<SessionLineItemOptions>
                 {
@@ -182,34 +170,43 @@ namespace TRS_API.Controllers
                 },
                 SuccessUrl = request.SuccessUrl ?? $"{Request.Scheme}://{Request.Host}/payment/result?status=success",
                 CancelUrl  = request.CancelUrl  ?? $"{Request.Scheme}://{Request.Host}/payment/result?status=cancel",
+
+                // ── CHANGED: added contact_name and contact_phone to metadata ──
+                // These three fields are stored on WebhookLog at receipt time so that
+                // Case-C admin reconciliation rows always show payer contact info
+                // without requiring a live Stripe API call per row.
                 Metadata = new Dictionary<string, string>
                 {
-                    // Store flow type so webhook knows this session has no pre-existing reg
                     { "flow",           "session_first" },
-                    { "payment_method", dbMethod },
+                    { "payment_method", dbMethod        },
                     { "event_id",       payload.EventId.ToString() },
                     { "contact_email",  payload.ContactEmail ?? "" },
-                }
+                    { "contact_name",   payload.ContactName  ?? "" },   // ADDED
+                    { "contact_phone",  payload.ContactPhone ?? "" },   // ADDED
+                },
+
+                // ── CHANGED: collect phone number at Stripe checkout ──────────
+                // Safety net in case metadata is missing for any reason.
+                // session.CustomerDetails.Phone will be populated for all future sessions.
+                PhoneNumberCollection = new SessionPhoneNumberCollectionOptions   // ADDED
+                {
+                    Enabled = true,
+                },
             };
 
             if (isPayNow) options.ExpiresAt = DateTime.UtcNow.AddMinutes(30);
 
-            // ── ONE ACTIVE PAYMENT LOCK RULE ─────────────────────────────────
-            // Enforce: user + event = at most ONE active PendingCheckout.
-            // If a non-expired row exists for this email + event, reuse its
-            // Stripe session rather than creating a new one.  This prevents
-            // duplicate payments from rapid retries or multiple browser tabs.
+            // ── ONE ACTIVE PAYMENT LOCK RULE ──────────────────────────────────
             var existingActive = await _db.PendingCheckouts
-                .Where(p => p.EventId == payload.EventId
-                        && p.ContactEmail == (payload.ContactEmail ?? "")
-                        && p.PaymentMethod == dbMethod
-                        && p.ExpiresAt > DateTime.UtcNow)
+                .Where(p => p.EventId        == payload.EventId
+                        && p.ContactEmail    == (payload.ContactEmail ?? "")
+                        && p.PaymentMethod   == dbMethod
+                        && p.ExpiresAt       > DateTime.UtcNow)
                 .OrderByDescending(p => p.CreatedAt)
                 .FirstOrDefaultAsync();
 
             if (existingActive != null)
             {
-                // Retrieve the existing Stripe session to get its checkout URL.
                 Session? existingSession = null;
                 try
                 {
@@ -217,8 +214,6 @@ namespace TRS_API.Controllers
                 }
                 catch (StripeException ex)
                 {
-                    // Session not found on Stripe (e.g. already expired there but not yet
-                    // pruned locally) — fall through to create a new one.
                     _logger.LogWarning(ex,
                         "Existing PendingCheckout session {SessionId} not found on Stripe; creating new session",
                         existingActive.GatewaySessionId);
@@ -227,33 +222,47 @@ namespace TRS_API.Controllers
 
                 if (existingSession != null && existingSession.Status == "open")
                 {
-                    _logger.LogInformation(
-                        "Reusing existing active PendingCheckout session {SessionId} for event {EventId} contact {Email}",
-                        existingActive.GatewaySessionId, payload.EventId, payload.ContactEmail);
-
-                    // Always update the stored payload to the latest cart so webhook
-                    // recovery reflects current selections if the user changed anything.
-                    existingActive.PayloadJson   = request.RegistrationPayload!.Value.GetRawText();
-                    existingActive.PaymentMethod = dbMethod;
-                    await _db.SaveChangesAsync();
-
-                    return Ok(new
+                    var existingPayloadHash = ComputePayloadHash(existingActive.PayloadJson);
+                    var existingAmountCents = existingSession.AmountTotal ?? 0;
+                    if (existingAmountCents == expectedAmountCents &&
+                        string.Equals(existingPayloadHash, newPayloadHash, StringComparison.Ordinal))
                     {
-                        checkoutUrl      = existingSession.Url,
-                        gatewaySessionId = existingActive.GatewaySessionId,
-                        paymentMethod    = dbMethod,
-                        expiresAt        = existingActive.ExpiresAt
-                    });
+                        _logger.LogInformation(
+                            "Reusing existing active PendingCheckout session {SessionId} for event {EventId} contact {Email}",
+                            existingActive.GatewaySessionId, payload.EventId, payload.ContactEmail);
+
+                        existingActive.PaymentMethod = dbMethod;
+                        existingActive.ExpiresAt = existingSession.ExpiresAt;
+                        await _db.SaveChangesAsync();
+
+                        return Ok(new
+                        {
+                            checkoutUrl      = existingSession.Url,
+                            gatewaySessionId = existingActive.GatewaySessionId,
+                            paymentMethod    = dbMethod,
+                            expiresAt        = existingActive.ExpiresAt
+                        });
+                    }
+
+                    _logger.LogInformation(
+                        "Expiring stale PendingCheckout session {SessionId}: amount/hash mismatch for event {EventId} contact {Email}",
+                        existingActive.GatewaySessionId, payload.EventId, payload.ContactEmail);
+                    try
+                    {
+                        await new SessionService().ExpireAsync(existingActive.GatewaySessionId);
+                    }
+                    catch (StripeException ex)
+                    {
+                        _logger.LogWarning(ex,
+                            "Failed to expire stale Stripe session {SessionId}; removing local PendingCheckout row",
+                            existingActive.GatewaySessionId);
+                    }
                 }
 
-                // Session is no longer open on Stripe — remove stale local row so we
-                // can create a fresh session below.
                 _db.PendingCheckouts.Remove(existingActive);
                 await _db.SaveChangesAsync();
             }
 
-            // PayNow sessions expire after 30 minutes, so rotate the idempotency key on the
-            // same cadence to avoid Stripe returning an expired checkout session on retry.
             var idempotencyKey = $"sf_{payload.EventId}_{method}_{payload.ContactEmail}_{(int)(totalAmount * 100)}_{DateTimeOffset.UtcNow.ToUnixTimeSeconds() / 600}";
             var requestOptions = new RequestOptions { IdempotencyKey = idempotencyKey };
 
@@ -263,29 +272,9 @@ namespace TRS_API.Controllers
                 "Created session-first {Method} Stripe session {SessionId} for event {EventId} contact {Email}",
                 dbMethod, session.Id, payload.EventId, payload.ContactEmail);
 
-            // ── Persist payload to PendingCheckouts ledger ────────────────────
-            // This is the safety net: if the user never returns to /payment/result,
-            // the Stripe webhook reads this row to reconstruct and save the registration.
-            //
-            // UPSERT — not insert-if-missing:
-            //   When the PayNow idempotency key rotates (every 30 min), Stripe creates
-            //   a new session and we always INSERT. For card sessions, the stable
-            //   idempotency key can cause Stripe to return an EXISTING session ID when
-            //   the user retries with a different cart but the same event + email + total.
-            //   In that case we must UPDATE the stored payload to the latest cart so the
-            //   webhook never replays a stale one.
-            //
-            // FATAL on failure:
-            //   If we cannot write this row we cannot guarantee recovery if the user
-            //   never returns from Stripe. Rather than silently hand the user a URL with
-            //   no safety net, we fail the request. The user retries and the next attempt
-            //   will succeed. A DB write failure here indicates a wider infrastructure
-            //   problem that should be surfaced immediately.
             var newExpiresAt   = session.ExpiresAt;
-            var newPayloadJson = request.RegistrationPayload!.Value.GetRawText();
 
-            var existing = await _db.PendingCheckouts
-                .FindAsync(session.Id);
+            var existing = await _db.PendingCheckouts.FindAsync(session.Id);
 
             if (existing == null)
             {
@@ -302,17 +291,12 @@ namespace TRS_API.Controllers
             }
             else
             {
-                // Session ID reused by Stripe (stable idempotency key, same amount).
-                // Always overwrite with the latest payload so webhook recovery is current.
                 existing.PayloadJson   = newPayloadJson;
                 existing.ContactEmail  = payload.ContactEmail ?? "";
                 existing.PaymentMethod = dbMethod;
                 existing.ExpiresAt     = newExpiresAt;
             }
 
-            // Fatal: if we cannot guarantee webhook recovery, do not give the user a
-            // checkout URL. Let the exception bubble to the outer try/catch which
-            // returns 500 — the user retries and the next attempt will succeed.
             await _db.SaveChangesAsync();
 
             _logger.LogInformation(
@@ -349,17 +333,17 @@ namespace TRS_API.Controllers
             if (existingPayment != null)
                 return BadRequest(new { message = "Payment already completed" });
 
-            var method = (request.PaymentMethod ?? "card").ToLower().Trim();
-            var isPayNow = method == "paynow";
+            var method      = (request.PaymentMethod ?? "card").ToLower().Trim();
+            var isPayNow    = method == "paynow";
             var stripeMethod = isPayNow ? "paynow" : "card";
-            var dbMethod = isPayNow ? "PayNow" : "CreditCard";
+            var dbMethod    = isPayNow ? "PayNow" : "CreditCard";
 
             if (isPayNow && !registration.Currency.Equals("SGD", StringComparison.OrdinalIgnoreCase))
                 return BadRequest(new { message = "PayNow is only available for SGD payments." });
 
             var options = new SessionCreateOptions
             {
-                Mode = "payment",
+                Mode               = "payment",
                 PaymentMethodTypes = new List<string> { stripeMethod },
                 LineItems = new List<SessionLineItemOptions>
                 {
@@ -414,9 +398,6 @@ namespace TRS_API.Controllers
         }
 
         // -- POST /api/Payment/confirm-session ---------------------------------
-        // Called by PaymentResult.tsx after Stripe redirects back with success.
-        // Verifies payment with Stripe, then writes Registration + Payment to DB.
-        // Idempotent: if already processed, returns existing registrationId.
         [EnableRateLimiting("payment")]
         [HttpPost("confirm-session")]
         public async Task<IActionResult> ConfirmSession([FromBody] ConfirmSessionRequest request)
@@ -447,6 +428,10 @@ namespace TRS_API.Controllers
             var result = await _paymentFinalization.FinalizeSessionFirstAsync(verifiedSession);
             if (!result.Success)
             {
+                await UpsertConfirmSessionFailureLogAsync(
+                    verifiedSession,
+                    $"{result.Code}: {result.Message}");
+
                 if (string.Equals(result.Code, "CHECKOUT_CONTEXT_MISSING", StringComparison.Ordinal))
                     return Conflict(new { code = result.Code, message = result.Message });
 
@@ -457,35 +442,53 @@ namespace TRS_API.Controllers
                     : BadRequest(new { code = result.Code, message = result.Message });
             }
 
-            // Send confirmation email when confirm-session wins the race
-            // (alreadyProcessed = webhook got there first — email already sent by webhook job)
-            if (!result.AlreadyProcessed)
-            {
-                var regIdForJob = result.RegistrationId;
-                await _jobQueue.EnqueueAsync(async ct =>
-                {
-                    using var scope    = _serviceScopeFactory.CreateScope();
-                    var receiptSvc     = scope.ServiceProvider.GetRequiredService<ReceiptService>();
-                    var emailSvc       = scope.ServiceProvider.GetRequiredService<EmailService>();
-                    var jobDb          = scope.ServiceProvider.GetRequiredService<TRSDbContext>();
-                    try
-                    {
-                        var pdfBytes = await receiptSvc.GenerateAsync(jobDb, regIdForJob);
-                        await emailSvc.SendPaymentConfirmationAsync(jobDb, regIdForJob, pdfBytes, ct);
-                        _logger.LogInformation(
-                            "Confirmation email sent for registration {RegId} via confirm-session path", regIdForJob);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogError(ex,
-                            "Failed to send confirmation email for registration {RegId}", regIdForJob);
-                    }
-                });
-            }
-
             return Ok(new { registrationId = result.RegistrationId.ToString() });
         }
 
+        private async Task UpsertConfirmSessionFailureLogAsync(Session session, string errorMessage)
+        {
+            var existingPayment = await _db.Payments
+                .AsNoTracking()
+                .AnyAsync(p => p.GatewaySessionId == session.Id);
+            if (existingPayment) return;
+
+            var log = await _db.WebhookLogs
+                .FirstOrDefaultAsync(w =>
+                    w.GatewaySessionId == session.Id &&
+                    w.ProcessingStatus == "F" &&
+                    (w.EventType == "checkout.session.completed" || w.EventType == "processing_error"));
+
+            var now = DateTime.UtcNow;
+            if (log == null)
+            {
+                log = new WebhookLog
+                {
+                    PaymentGateway = "stripe",
+                    GatewayEventId = $"confirm_session_{session.Id}",
+                    EventType = "checkout.session.completed",
+                    PayloadJson = JsonSerializer.Serialize(session),
+                    ProcessingStatus = "F",
+                    ReceivedAt = now,
+                };
+                _db.WebhookLogs.Add(log);
+            }
+
+            log.ErrorMessage = errorMessage;
+            log.ProcessedAt = now;
+            log.GatewaySessionId = session.Id;
+            log.ContactName = session.Metadata?.GetValueOrDefault("contact_name")
+                              ?? session.CustomerDetails?.Name;
+            log.ContactEmail = session.Metadata?.GetValueOrDefault("contact_email")
+                               ?? session.CustomerDetails?.Email;
+            log.ContactPhone = session.Metadata?.GetValueOrDefault("contact_phone")
+                               ?? session.CustomerDetails?.Phone;
+            log.Amount = session.AmountTotal.HasValue
+                ? session.AmountTotal.Value / 100m
+                : null;
+            log.Currency = session.Currency?.ToUpperInvariant();
+
+            await _db.SaveChangesAsync();
+        }
 
         // -- GET /api/Payment/verify/:paymentId --------------------------------
         [HttpGet("verify/{paymentId}")]
@@ -502,14 +505,14 @@ namespace TRS_API.Controllers
 
                 return Ok(new
                 {
-                    paymentId = payment.PaymentId,
-                    registrationId = payment.RegistrationId,
-                    amount = payment.Amount,
-                    currency = payment.Currency,
-                    status = payment.PaymentStatus,
-                    method = payment.PaymentMethod,
-                    paidAt = payment.PaidAt,
-                    receiptNumber = payment.ReceiptNumber,
+                    paymentId        = payment.PaymentId,
+                    registrationId   = payment.RegistrationId,
+                    amount           = payment.Amount,
+                    currency         = payment.Currency,
+                    status           = payment.PaymentStatus,
+                    method           = payment.PaymentMethod,
+                    paidAt           = payment.PaidAt,
+                    receiptNumber    = payment.ReceiptNumber,
                     gatewayPaymentId = payment.GatewayPaymentId
                 });
             }
@@ -522,16 +525,39 @@ namespace TRS_API.Controllers
 
         internal static void ApplyRefundOutcome(Payment payment)
         {
-            var totalItems = payment.Items.Count;
-            var refundedItems = payment.Items.Count(i => i.ItemStatus == "R");
+            var paidAmount = payment.Amount;
+            var refundedAmount = payment.Refunds
+                .Where(r => r.RefundStatus == "S")
+                .Sum(r => r.RefundAmount);
 
-            payment.PaymentStatus = refundedItems switch
+            payment.PaymentStatus = refundedAmount switch
             {
-                0 => "S",
-                var count when count >= totalItems && totalItems > 0 => "FR",
+                <= 0m => "S",
+                var amount when amount >= paidAmount => "FR",
                 _ => "PR",
             };
             payment.UpdatedAt = DateTime.UtcNow;
+        }
+
+        internal static void ApplyRefundItemOutcome(Payment payment, PaymentItem item)
+        {
+            var refundedAmount = payment.Refunds
+                .Where(r => r.PaymentItemId == item.PaymentItemId && r.RefundStatus == "S")
+                .Sum(r => r.RefundAmount);
+
+            item.ItemStatus = refundedAmount >= item.Amount ? "R" : "S";
+            item.UpdatedAt = DateTime.UtcNow;
+        }
+
+        private static long ToMinorUnits(decimal amount) =>
+            decimal.ToInt64(decimal.Round(amount * 100m, 0, MidpointRounding.AwayFromZero));
+
+        private static string ComputePayloadHash(string payloadJson)
+        {
+            using var doc = JsonDocument.Parse(payloadJson);
+            var normalized = JsonSerializer.Serialize(doc.RootElement);
+            var bytes = SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(normalized));
+            return Convert.ToHexString(bytes);
         }
     }
 }

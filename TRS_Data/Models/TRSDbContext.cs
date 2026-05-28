@@ -317,6 +317,8 @@ public partial class TRSDbContext : DbContext
             e.Property(x => x.RefundId).HasColumnName("RefundID");
             e.Property(x => x.PaymentId).HasColumnName("PaymentID");
             e.Property(x => x.PaymentItemId).HasColumnName("PaymentItemID");
+            e.Property(x => x.GatewaySessionId).HasMaxLength(255).HasColumnName("GatewaySessionId");
+            e.Property(x => x.WebhookLogId).HasColumnName("WebhookLogId");
             e.Property(x => x.PaymentGateway).HasMaxLength(20).IsUnicode(false);
             e.Property(x => x.GatewayRefundId).HasMaxLength(255).IsUnicode(false).HasColumnName("GatewayRefundID");
             e.Property(x => x.RefundAmount).HasColumnType("decimal(10,2)");
@@ -331,6 +333,13 @@ public partial class TRSDbContext : DbContext
              .HasConstraintName("FK_Refunds_Payment");
             e.HasOne(x => x.PaymentItem).WithMany(x => x.Refunds)
              .HasForeignKey(x => x.PaymentItemId).HasConstraintName("FK_Refunds_PaymentItem");
+            e.HasOne(x => x.WebhookLog).WithMany()
+             .HasForeignKey(x => x.WebhookLogId).IsRequired(false)
+             .HasConstraintName("FK_Refunds_WebhookLog");
+            e.HasIndex(x => x.GatewaySessionId)
+             .IsUnique()
+             .HasDatabaseName("UX_Refunds_OrphanActive_GatewaySessionId")
+             .HasFilter("[PaymentID] IS NULL AND [GatewaySessionId] IS NOT NULL AND [RefundStatus] IN ('P','S')");
         });
 
         // Fixtures
@@ -361,9 +370,15 @@ public partial class TRSDbContext : DbContext
             e.Property(x => x.WebhookLogId).HasColumnName("WebhookLogID");
             e.Property(x => x.PaymentGateway).HasMaxLength(20).IsUnicode(false);
             e.Property(x => x.GatewayEventId).HasMaxLength(255).IsUnicode(false).HasColumnName("GatewayEventID");
+            e.Property(x => x.GatewaySessionId).HasMaxLength(255).HasColumnName("GatewaySessionId");
             e.Property(x => x.EventType).HasMaxLength(100).IsUnicode(false);
             e.Property(x => x.PayloadJson).HasColumnName("PayloadJSON");
             e.Property(x => x.ProcessingStatus).HasMaxLength(1).IsUnicode(false).IsFixedLength().HasDefaultValue("P");
+            e.Property(x => x.ContactName).HasMaxLength(200);
+            e.Property(x => x.ContactEmail).HasMaxLength(200);
+            e.Property(x => x.ContactPhone).HasMaxLength(50);
+            e.Property(x => x.Amount).HasColumnType("decimal(10,2)");
+            e.Property(x => x.Currency).HasMaxLength(10);
             // FIX: was "(getdate())" — DB uses sysutcdatetime()
             e.Property(x => x.ReceivedAt).HasDefaultValueSql("(sysutcdatetime())");
             e.Property(x => x.PaymentId).HasColumnName("PaymentID");
