@@ -40,24 +40,26 @@ public class UpdateConfigRequest
 // ── Events ────────────────────────────────────────────────────────────────────
 public class UpsertEventRequest
 {
-    [Required] public string Name { get; set; } = null!;
-    public string? Description { get; set; }
-    [Required] public string Venue { get; set; } = null!;
-    public string? VenueAddress { get; set; }
-    public string? BannerUrl { get; set; }
-    public string? ProspectusUrl { get; set; }
+    [Required] public string Name         { get; set; } = null!;
+    public string? Description            { get; set; }
+    [Required] public string Venue        { get; set; } = null!;
+    public string? VenueAddress           { get; set; }
+    public string? BannerUrl              { get; set; }
+    // ProspectusUrl removed — documents managed via /api/events/:id/documents
+    public string? AdditionalInfo         { get; set; }   // sanitised HTML
     [Required] public string EventStartDate { get; set; } = null!;
-    public string? EventEndDate { get; set; }
-    [Required] public string OpenDate { get; set; } = null!;
-    [Required] public string CloseDate { get; set; } = null!;
-    public int MaxParticipants { get; set; } = 100;
-    public string? SponsorInfo { get; set; }
-    public string? ConsentStatement { get; set; }
-    public bool IsSports { get; set; } = true;
-    public string? SportType { get; set; }
-    public string FixtureMode { get; set; } = "internal";
-    public List<string> GalleryUrls { get; set; } = new();
+    public string? EventEndDate           { get; set; }
+    [Required] public string OpenDate     { get; set; } = null!;
+    [Required] public string CloseDate    { get; set; } = null!;
+    public int MaxParticipants            { get; set; } = 100;
+    public string? SponsorInfo            { get; set; }
+    public string? ConsentStatement       { get; set; }
+    public bool IsSports                  { get; set; } = true;
+    public string? SportType              { get; set; }
+    public string FixtureMode             { get; set; } = "internal";
+    public List<string> GalleryUrls       { get; set; } = new();
 }
+
 public class UpsertProgramRequest
 {
     [Required] public string Name { get; set; } = null!;
@@ -92,6 +94,23 @@ public class CustomFieldDto
     public bool IsRequired { get; set; }
     public string? Options { get; set; }
     public int SortOrder { get; set; }
+}
+
+/// <summary>Inbound DTO for creating or updating a document attachment.</summary>
+public class UpsertEventDocumentRequest
+{
+    [Required] public string Label    { get; set; } = null!;
+    [Required] public string FileUrl  { get; set; } = null!;
+    public int DisplayOrder           { get; set; } = 0;
+}
+
+/// <summary>Outbound DTO for document attachments embedded in event responses.</summary>
+public class EventDocumentDto
+{
+    public int    Id           { get; set; }
+    public string Label        { get; set; } = null!;
+    public string FileUrl      { get; set; } = null!;
+    public int    DisplayOrder { get; set; }
 }
 
 // ── Registrations ─────────────────────────────────────────────────────────────

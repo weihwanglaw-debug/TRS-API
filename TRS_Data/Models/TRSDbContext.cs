@@ -11,6 +11,7 @@ public partial class TRSDbContext : DbContext
     public virtual DbSet<AdminUser>                  AdminUsers                 { get; set; }
     public virtual DbSet<Event>                      Events                     { get; set; }
     public virtual DbSet<EventGalleryImage>          EventGalleryImages         { get; set; }
+    public virtual DbSet<EventDocument>              EventDocuments             { get; set; }
     public virtual DbSet<TrsProgram>                 Programs                   { get; set; }
     public virtual DbSet<ProgramField>               ProgramFields              { get; set; }
     public virtual DbSet<ProgramCustomField>         ProgramCustomFields        { get; set; }
@@ -69,7 +70,7 @@ public partial class TRSDbContext : DbContext
             e.Property(x => x.Venue).HasMaxLength(300);
             e.Property(x => x.VenueAddress).HasMaxLength(500);
             e.Property(x => x.BannerUrl).HasMaxLength(1000);
-            e.Property(x => x.ProspectusUrl).HasMaxLength(1000);
+            e.Property(x => x.AdditionalInfo).HasColumnType("nvarchar(max)");
             e.Property(x => x.SportType).HasMaxLength(100);
             e.Property(x => x.FixtureMode).HasMaxLength(15).IsUnicode(false).HasDefaultValue("internal");
             e.Property(x => x.MaxParticipants).HasDefaultValue(100);
@@ -88,6 +89,18 @@ public partial class TRSDbContext : DbContext
             e.HasOne(x => x.Event).WithMany(x => x.GalleryImages)
              .HasForeignKey(x => x.EventId).OnDelete(DeleteBehavior.Cascade)
              .HasConstraintName("FK_EventGalleryImages_Event");
+        });
+        
+        // EventDocuments
+        mb.Entity<EventDocument>(e => {
+            e.HasKey(x => x.EventDocumentId).HasName("PK_EventDocuments");
+            e.Property(x => x.EventDocumentId).HasColumnName("EventDocumentId");
+            e.Property(x => x.Label).HasMaxLength(100);
+            e.Property(x => x.FileUrl).HasMaxLength(500);
+            e.Property(x => x.DisplayOrder).HasDefaultValue(0);
+            e.HasOne(x => x.Event).WithMany(x => x.Documents)
+            .HasForeignKey(x => x.EventId).OnDelete(DeleteBehavior.Cascade)
+            .HasConstraintName("FK_EventDocuments_Events");
         });
 
         // Programs (TrsProgram → table name Programs)
